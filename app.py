@@ -27,9 +27,13 @@ def webhook():
         token = request.args.get('hub.verify_token')
         challenge = request.args.get('hub.challenge')
         
+        # Debugging ke liye prints
+        print(f"DEBUG -> Mode: {mode}, Token Received: {token}, Expected Token: {VERIFY_TOKEN}")
+        
         if mode == 'subscribe' and token == VERIFY_TOKEN:
             return str(challenge), 200, {'Content-Type': 'text/plain'}
         
+        print("DEBUG -> Verification Failed!")
         return 'Verification failed', 403
 
     elif request.method == 'POST':
@@ -111,4 +115,4 @@ def send_simple_message(recipient_id, text):
         "message": {"text": text}
     }
     requests.post(url, json=payload)
-        
+    
