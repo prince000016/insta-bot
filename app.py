@@ -21,7 +21,8 @@ def verify():
     challenge = request.args.get('hub.challenge')
     
     if mode == 'subscribe' and token == VERIFY_TOKEN:
-        return challenge, 200
+        return str(challenge), 200, {'Content-Type': 'text/plain'}
+        
     return 'Verification failed', 403
 
 # 2. Receive DM Notification (Jab koi Reel DM karega)
