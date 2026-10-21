@@ -42,6 +42,7 @@ def webhook():
 
     data = request.get_json(silent=True) or {}
     print("Webhook received; object:", data.get("object"))
+    print("FULL WEBHOOK DATA:", data)
 
     try:
         for entry in data.get("entry", []):
