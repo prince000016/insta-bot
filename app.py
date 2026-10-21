@@ -63,10 +63,10 @@ def webhook():
     return "OK", 200
 
 
+
 def process_message_event(event):
     sender = event.get("sender") or {}
     sender_id = sender.get("id")
-
     message = event.get("message") or {}
     attachments = message.get("attachments") or []
 
@@ -75,48 +75,38 @@ def process_message_event(event):
         return
 
     for attachment in attachments:
-        
-attachment_type = attachment.get("type")
-payload = attachment.get("payload") or {}
+        attachment_type = attachment.get("type")
+        payload = attachment.get("payload") or {}
 
-if attachment_type not in ("share", "ig_reel", "ig_post"):
-    continue
-
-reel_url = payload.get("url")
-reel_id = (
-    payload.get("reel_video_id")
-    or payload.get("ig_post_media_id")
-)
-
-if not reel_id and reel_url:
-    reel_id = extract_reel_id(reel_url)
-    
-            
-
-        
-    
-
-        if not reel_url:
-            print("Share attachment had no URL.")
+        if attachment_type not in ("share", "ig_reel", "ig_post"):
             continue
 
-        
+        reel_url = payload.get("url")
+        reel_id = payload.get("reel_video_id") or payload.get("ig_post_media_id")
+
+        if not reel_id and reel_url:
+            reel_id = extract_reel_id(reel_url)
+
         if not reel_id:
+            print("Reel ID could not be extracted:", payload)
             send_simple_message(
                 sender_id,
-                "Reel link mil gaya, lekin uska ID identify nahi hua."
+                "Reel mil gayi, lekin ID identify nahi hui."
             )
             continue
 
-        
+        print("Detected Reel ID:", reel_id)
+        product_data = get_products_from_db(reel_id)
 
         if product_data:
             send_product_buttons(sender_id, product_data)
         else:
+            print("No product found for Reel ID:", reel_id)
             send_simple_message(
                 sender_id,
                 "Is reel ke product links abhi database mein nahi mile."
             )
+            
 
 
 def extract_reel_id(url):
