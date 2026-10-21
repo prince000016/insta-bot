@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import base64
 import requests
 from urllib.parse import quote_plus, urlparse
 from flask import Flask, request
@@ -12,6 +13,7 @@ PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "").strip()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
@@ -19,13 +21,15 @@ API_URL = (
     "https://graph.instagram.com/v26.0/me/messages"
     f"?access_token={PAGE_ACCESS_TOKEN}"
 )
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash:generateContent"
+)
 
-# Only links on these shopping domains are treated as direct product links.
 SHOPPING_DOMAINS = (
     "amazon.", "amzn.to", "flipkart.com", "fkrt.it", "meesho.com",
     "myntra.com", "nykaa.com", "ajio.com", "snapdeal.com"
 )
-
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
@@ -45,10 +49,8 @@ def webhook():
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-
         if mode == "subscribe" and token == VERIFY_TOKEN:
             return challenge or "", 200, {"Content-Type": "text/plain"}
-
         return "Verification failed", 403
 
     data = request.get_json(silent=True) or {}
@@ -59,7 +61,6 @@ def webhook():
         for entry in data.get("entry", []):
             for event in entry.get("messaging", []):
                 process_message_event(event)
-
             for change in entry.get("changes", []):
                 value = change.get("value", {})
                 if change.get("field") == "messages":
@@ -80,7 +81,6 @@ def process_message_event(event):
         print("No sender ID in event.")
         return
 
-    # Some webhook events may contain plain text/caption-like content.
     text_content = message.get("text") or ""
     if text_content:
         direct_links = extract_shopping_links(text_content)
@@ -106,7 +106,6 @@ def process_message_event(event):
             or payload.get("media_id")
         )
 
-        # Check any caption/text actually supplied in the webhook payload.
         caption_text = " ".join(
             str(payload.get(key) or "")
             for key in ("caption", "title", "text", "description")
@@ -123,37 +122,49 @@ def process_message_event(event):
             else:
                 send_simple_message(
                     sender_id,
-                    "Reel mil gayi, lekin ID identify nahi hui. Is Reel ka link/caption text ke saath bhej do."
+                    "Reel mil gayi, lekin ID identify nahi hui. Reel ka link/caption text ke saath bhej do."
                 )
             continue
 
         print("Detected Reel ID:", reel_id)
 
-        # Keep existing behaviour first: known products from Supabase.
+        # Preserve existing saved products first.
         product_data = get_products_from_db(reel_id)
         if product_data and has_product_links(product_data):
             send_product_buttons(sender_id, product_data)
             continue
 
-        # Prefer a shopping URL if the webhook actually provided one.
+        # If the webhook includes a real shopping link, use it.
         if direct_links:
             product_data = make_product_row(reel_id, direct_links, "Link from Reel caption/metadata")
             save_products_to_db(product_data)
             send_product_buttons(sender_id, product_data)
             continue
 
-        # No caption/link was supplied. Use only text we actually have.
-        search_terms = make_search_terms(caption_text or payload.get("title") or "")
+        # Visual analysis only works when the webhook provides an accessible image URL.
+        image_url = find_image_url(payload)
+        if not image_url and reel_url:
+            image_url = discover_public_thumbnail(reel_url)
+
+        visual_terms = ""
+        if image_url and GEMINI_API_KEY:
+            visual_terms = identify_product_from_image_url(image_url)
+        elif image_url and not GEMINI_API_KEY:
+            print("Image URL present but GEMINI_API_KEY is missing.")
+        else:
+            print("No accessible thumbnail found; continuing with caption/title fallback.")
+
+        search_terms = visual_terms or make_search_terms(caption_text or payload.get("title") or "")
         if search_terms:
             product_data = make_search_row(reel_id, search_terms)
             save_products_to_db(product_data)
             send_product_buttons(sender_id, product_data)
         else:
-            print("No caption/product keywords available for Reel ID:", reel_id)
+            print("No visual details or caption/product keywords available for Reel ID:", reel_id)
             send_simple_message(
                 sender_id,
-                "Reel mil gayi, lekin Instagram ne product caption nahi diya. "
-                "Product ka naam ya caption text bhej do; phir main shopping-search links bana sakta hoon."
+                "Reel mil gayi, lekin product identify karne ke liye caption ya accessible thumbnail nahi mila. "
+                "Product ka naam/caption bhej do, main shopping-search links bana dunga."
             )
 
 
@@ -169,8 +180,112 @@ def extract_reel_id(url):
     return None
 
 
+
+def discover_public_thumbnail(reel_url):
+    """Best-effort lookup of a public Reel page's Open Graph image."""
+    if not reel_url or not reel_url.startswith("https://www.instagram.com/"):
+        return None
+    try:
+        response = requests.get(
+            reel_url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36"},
+            allow_redirects=True,
+        )
+        print("Public Reel page status:", response.status_code)
+        if response.status_code != 200:
+            return None
+
+        page = response.text[:2000000]
+        # Inspect each meta tag and read its property/name and content attributes.
+        for tag in re.findall(r"<meta\\b[^>]*>", page, flags=re.IGNORECASE):
+            key_match = re.search(r"""(?:property|name)\\s*=\\s*["'](og:image|twitter:image)["']""", tag, flags=re.IGNORECASE)
+            value_match = re.search(r"""content\\s*=\\s*["']([^"']+)["']""", tag, flags=re.IGNORECASE)
+            if key_match and value_match:
+                candidate = html.unescape(value_match.group(1)).replace("&amp;", "&")
+                if candidate.startswith("https://"):
+                    print("Public Reel thumbnail metadata found.")
+                    return candidate
+        print("No og:image/twitter:image found in public Reel page.")
+    except Exception as exc:
+        print("Public thumbnail lookup failed:", str(exc))
+    return None
+
+
+def find_image_url(payload):
+    """Find image URLs only when Instagram actually includes one in the webhook payload."""
+    keys = ("thumbnail_url", "image_url", "image", "media_url", "thumbnail")
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.startswith("https://"):
+            path = urlparse(value).path.lower()
+            if any(path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")) or key in ("thumbnail_url", "image_url", "image", "thumbnail"):
+                return value
+        if isinstance(value, dict):
+            nested = value.get("url") or value.get("src")
+            if isinstance(nested, str) and nested.startswith("https://"):
+                return nested
+    return None
+
+
+def identify_product_from_image_url(image_url):
+    """Download a publicly accessible image and ask Gemini for a concise product query."""
+    if not GEMINI_API_KEY:
+        return ""
+    try:
+        image_response = requests.get(
+            image_url,
+            timeout=12,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        image_response.raise_for_status()
+        content_type = image_response.headers.get("Content-Type", "").split(";")[0].lower()
+        if not content_type.startswith("image/"):
+            print("Visual analysis skipped: URL did not return an image.")
+            return ""
+        if len(image_response.content) > 8 * 1024 * 1024:
+            print("Visual analysis skipped: image is larger than 8 MB.")
+            return ""
+
+        mime_type = content_type if content_type in ("image/jpeg", "image/png", "image/webp", "image/heic", "image/heif") else "image/jpeg"
+        encoded = base64.b64encode(image_response.content).decode("ascii")
+        body = {
+            "contents": [{
+                "parts": [
+                    {"text": (
+                        "Look at this product image. Identify only visible product category, "
+                        "brand/model if clearly readable, and useful shopping search keywords. "
+                        "Do not guess a brand if not visible. Return one concise search query only."
+                    )},
+                    {"inline_data": {"mime_type": mime_type, "data": encoded}}
+                ]
+            }],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 80}
+        }
+        response = requests.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json=body,
+            timeout=25
+        )
+        print("Gemini API status:", response.status_code)
+        if response.status_code != 200:
+            print("Gemini API error:", response.text[:800])
+            return ""
+        result = response.json()
+        candidates = result.get("candidates") or []
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        text_value = " ".join(p.get("text", "") for p in parts).strip()
+        text_value = re.sub(r"\s+", " ", text_value)
+        if text_value and text_value.lower() not in ("unknown", "none", "not identifiable"):
+            print("Gemini visual product query:", text_value[:200])
+            return text_value[:180]
+    except Exception as exc:
+        print("Gemini visual analysis failed:", str(exc))
+    return ""
+
+
 def extract_shopping_links(text):
-    """Extract only URLs whose host looks like a known shopping domain."""
     found = []
     for raw_url in URL_RE.findall(text or ""):
         url = raw_url.rstrip(".,);]")
@@ -185,12 +300,10 @@ def extract_shopping_links(text):
 
 
 def make_search_terms(text):
-    """Use available text only; do not pretend to identify unseen video content."""
     cleaned = html.unescape(str(text or ""))
     cleaned = URL_RE.sub(" ", cleaned)
     cleaned = re.sub(r"@\w+|#\w+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    # Avoid generic links from short/empty captions.
     if len(cleaned) < 4:
         return ""
     return cleaned[:180]
@@ -246,8 +359,6 @@ def save_products_to_db(data):
     if supabase is None:
         print("Supabase is not configured; cannot save product links.")
         return False
-
-    # Keep the existing table and columns. Update existing reel row, otherwise insert.
     try:
         existing = (
             supabase.table("reels_products")
@@ -272,34 +383,27 @@ def save_products_to_db(data):
 
 def send_product_buttons(recipient_id, data):
     elements = []
-
     for index in range(1, 4):
         title = data.get(f"product_{index}_title")
         product_url = data.get(f"product_{index}_url")
-
         if title and product_url and str(product_url).startswith(("https://", "http://")):
             elements.append({
                 "title": str(title)[:80],
                 "buttons": [{
                     "type": "web_url",
                     "url": str(product_url),
-                    "title": "Open Link" if "Search " in str(title) else "Buy Now"
+                    "title": "Open Link" if str(title).startswith("Search ") else "Buy Now"
                 }]
             })
-
     if not elements:
         send_simple_message(recipient_id, "Is Reel ke product links abhi available nahi hain.")
         return
-
     payload = {
         "recipient": {"id": recipient_id},
         "message": {
             "attachment": {
                 "type": "template",
-                "payload": {
-                    "template_type": "generic",
-                    "elements": elements
-                }
+                "payload": {"template_type": "generic", "elements": elements}
             }
         }
     }
@@ -312,11 +416,10 @@ def send_links_as_buttons(recipient_id, links, label):
 
 
 def send_simple_message(recipient_id, text):
-    payload = {
+    send_api_request({
         "recipient": {"id": recipient_id},
         "message": {"text": text}
-    }
-    send_api_request(payload)
+    })
 
 
 def send_api_request(payload):
