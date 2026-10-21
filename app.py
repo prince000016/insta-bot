@@ -373,7 +373,7 @@ def make_search_terms(text):
     # A caption with only generic words is not a reliable product identifier.
     if cleaned.lower() in {"this look", "outfit", "fashion", "shopping", "reel", "instagram"}:
         return ""
-    return cleaned[:120]
+    return cleaned[:60]
 
 
 def make_search_row(reel_id, terms):
@@ -579,7 +579,7 @@ def build_comparison_url(data):
 
 
 def send_product_buttons(recipient_id, data, skip_follow_check=False):
-    # Keep existing follow-verification behavior unchanged.
+    # Preserve existing follow-verification behavior.
     if not skip_follow_check and FOLLOW_CHECK_PAGE_TOKEN:
         status = get_follow_status(recipient_id)
         if status is not True:
@@ -593,15 +593,14 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
                 )
             return
 
-    # Instagram DM: send each store as a separate text line (not a side-by-side card).
-    # Search rows keep the search terms in their title; create all store search URLs here.
+    # Search results: short query + eight stores, split into safe-sized DM messages.
     search_title = next(
         (str(data.get(f"product_{i}_title") or "") for i in range(1, 4)
          if str(data.get(f"product_{i}_title") or "").lower().startswith("search ")),
         "",
     )
     if search_title and ":" in search_title:
-        terms = search_title.split(":", 1)[1].strip()
+        terms = search_title.split(":", 1)[1].strip()[:60]
         query = quote_plus(terms)
         stores = [
             ("Amazon", f"https://www.amazon.in/s?k={query}"),
@@ -613,13 +612,13 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
             ("Snapdeal", f"https://www.snapdeal.com/search?keyword={query}"),
             ("Google Shopping", f"https://www.google.com/search?tbm=shop&q={query}"),
         ]
-        message_lines = [f"🛍️ Product search links for: {terms}", ""]
-        message_lines.extend(f"{index}. {name}: {url}" for index, (name, url) in enumerate(stores, 1))
-        message_lines.append("\nNote: Links open store search results; exact product/stock may vary.")
-        send_simple_message(recipient_id, "\n".join(message_lines))
+        lines = [f"🛍️ Product search: {terms}", ""]
+        lines.extend(f"{i}. {name}: {url}" for i, (name, url) in enumerate(stores, 1))
+        lines.append("These open store search results; exact product/stock may vary.")
+        _send_text_in_chunks(recipient_id, "\n".join(lines), max_chars=850)
         return
 
-    # For actual shopping links received in a Reel/message, list each URL on its own line.
+    # Actual links from a message/reel caption: keep each link on its own line.
     lines = ["🛍️ Product links", ""]
     count = 0
     for index in range(1, 4):
@@ -627,12 +626,32 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
         url = str(data.get(f"product_{index}_url") or "").strip()
         if title and url.startswith(("https://", "http://")):
             count += 1
-            label = title[:70]
-            lines.append(f"{count}. {label}: {url}")
+            lines.append(f"{count}. {title[:55]}: {url}")
     if count:
-        send_simple_message(recipient_id, "\n".join(lines))
+        _send_text_in_chunks(recipient_id, "\n".join(lines), max_chars=850)
     else:
         send_simple_message(recipient_id, "Is Reel ke product links abhi available nahi hain.")
+
+
+def _send_text_in_chunks(recipient_id, text, max_chars=850):
+    """Send line-by-line DM text in chunks below Instagram's 1000-char limit."""
+    chunks = []
+    current = ""
+    for line in str(text or "").splitlines():
+        candidate = line if not current else current + "\n" + line
+        if len(candidate) > max_chars and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+        # Extremely long individual URLs/lines are split defensively.
+        while len(current) > max_chars:
+            chunks.append(current[:max_chars])
+            current = current[max_chars:]
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        send_simple_message(recipient_id, chunk[:950])
 
 
 def send_links_as_buttons(recipient_id, links, label):
@@ -662,4 +681,4 @@ def send_api_request(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-        
+    
