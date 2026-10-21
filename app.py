@@ -2,7 +2,6 @@ import os
 import re
 import html
 import base64
-import json
 import requests
 from urllib.parse import quote_plus, urlparse
 from flask import Flask, request, send_file
@@ -138,11 +137,10 @@ def process_message_event(event):
                 send_simple_message(sender_id, "Gemini key configured nahi hai; product ka naam text mein bhej do.")
                 continue
 
-            visual_products = identify_products_from_image_url(image_url)
-            if visual_products:
-                print("Gemini identified products from DM image:", visual_products)
-                product_data = make_multi_search_row(f"image-{sender_id}", visual_products)
-                save_products_to_db(product_data)
+            visual_terms = identify_product_from_image_url(image_url)
+            if visual_terms:
+                print("Gemini identified product from DM image:", visual_terms[:160])
+                product_data = make_search_row(f"image-{sender_id}", visual_terms)
                 send_product_buttons(sender_id, product_data)
             else:
                 send_simple_message(
@@ -183,11 +181,23 @@ def process_message_event(event):
 
         print("Detected Reel ID:", reel_id)
 
-        # Preserve existing saved products first.
+        # Reuse cached product cards, but retry older single-query cache entries
+        # so newly enabled visual multi-product detection can replace them.
         product_data = get_products_from_db(reel_id)
         if product_data and has_product_links(product_data):
-            send_product_buttons(sender_id, product_data)
-            continue
+            cached_titles = [
+                str(product_data.get(f"product_{i}_title") or "").strip()
+                for i in range(1, 4)
+            ]
+            cached_count = sum(bool(title) for title in cached_titles)
+            is_old_single_search = (
+                cached_count == 1
+                and cached_titles[0].lower().startswith("search amazon:")
+            )
+            if not is_old_single_search:
+                send_product_buttons(sender_id, product_data)
+                continue
+            print("Old single-search cache found; retrying product detection:", reel_id)
 
         # If the webhook includes a real shopping link, use it.
         if direct_links:
@@ -202,19 +212,24 @@ def process_message_event(event):
             image_url = discover_public_thumbnail(reel_url)
 
         visual_products = []
+        visual_terms = ""
         if image_url and GEMINI_API_KEY:
-            visual_products = identify_products_from_image_url(image_url)
+            visual_products = identify_products_from_image_url(image_url, max_products=3)
+            # Keep the older single-query analyzer as a fallback if the multi-item
+            # response is unavailable or the image shows only one uncertain item.
+            if not visual_products:
+                visual_terms = identify_product_from_image_url(image_url)
         elif image_url and not GEMINI_API_KEY:
             print("Image URL present but GEMINI_API_KEY is missing.")
         else:
             print("No accessible thumbnail found; continuing with caption/title fallback.")
 
         if visual_products:
-            product_data = make_multi_search_row(reel_id, visual_products)
+            product_data = make_multi_product_row(reel_id, visual_products)
             save_products_to_db(product_data)
             send_product_buttons(sender_id, product_data)
         else:
-            search_terms = make_search_terms(caption_text) or make_search_terms(payload.get("title") or "")
+            search_terms = visual_terms or make_search_terms(caption_text) or make_search_terms(payload.get("title") or "")
             if search_terms:
                 product_data = make_search_row(reel_id, search_terms)
                 save_products_to_db(product_data)
@@ -258,9 +273,9 @@ def discover_public_thumbnail(reel_url):
 
         page = response.text[:2000000]
         # Inspect each meta tag and read its property/name and content attributes.
-        for tag in re.findall(r"<meta\\b[^>]*>", page, flags=re.IGNORECASE):
-            key_match = re.search(r"""(?:property|name)\\s*=\\s*["'](og:image|twitter:image)["']""", tag, flags=re.IGNORECASE)
-            value_match = re.search(r"""content\\s*=\\s*["']([^"']+)["']""", tag, flags=re.IGNORECASE)
+        for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.IGNORECASE):
+            key_match = re.search(r"""(?:property|name)\s*=\s*["'](og:image|twitter:image)["']""", tag, flags=re.IGNORECASE)
+            value_match = re.search(r"""content\s*=\s*["']([^"']+)["']""", tag, flags=re.IGNORECASE)
             if key_match and value_match:
                 candidate = html.unescape(value_match.group(1)).replace("&amp;", "&")
                 if candidate.startswith("https://"):
@@ -345,71 +360,107 @@ def identify_product_from_image_url(image_url):
     return ""
 
 
-def identify_products_from_image_url(image_url):
-    """Identify up to three distinct purchasable products visible in an accessible image."""
+
+def identify_products_from_image_url(image_url, max_products=3):
+    """Identify distinct visible products from a Reel thumbnail using Gemini.
+
+    Returns a list of concise product search names. A thumbnail is not a full
+    video, so this intentionally reports only products visibly supported by it.
+    """
     if not GEMINI_API_KEY or not image_url:
         return []
     try:
-        image_response = requests.get(image_url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        image_response = requests.get(
+            image_url,
+            timeout=12,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
         image_response.raise_for_status()
         content_type = image_response.headers.get("Content-Type", "").split(";")[0].lower()
         if not content_type.startswith("image/") or len(image_response.content) > 8 * 1024 * 1024:
-            print("Multi-product analysis skipped: unsupported image response.")
+            print("Multi-product analysis skipped: URL is not a supported image or exceeds 8 MB.")
             return []
+
         mime_type = content_type if content_type in (
             "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"
         ) else "image/jpeg"
         encoded = base64.b64encode(image_response.content).decode("ascii")
+        prompt = (
+            "Identify distinct consumer products clearly visible in this image. "
+            "Return ONLY a JSON array of 1 to " + str(max_products) + " short product search names. "
+            "Include brand/model only when readable or clearly recognizable; do not invent brands. "
+            "Do not return people, captions, hashtags, generic marketing phrases, or duplicate variants. "
+            "If the image does not show a clearly identifiable product, return []. "
+            'Example: ["Beardo Godfather perfume", "Beardo Toxic perfume"]'
+        )
         body = {
-            "contents": [{
-                "parts": [
-                    {"text": (
-                        "Identify up to 3 distinct purchasable products clearly visible in this image. "
-                        "Return ONLY a JSON array of short shopping search names, for example "
-                        '[\"Beardo Godfather perfume\", \"Ajmal Oud perfume\"]. '
-                        "Use brand/model only if readable or confidently identifiable. Do not invent products. "
-                        "If no product is identifiable, return []."
-                    )},
-                    {"inline_data": {"mime_type": mime_type, "data": encoded}},
-                ]
-            }],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 150},
+            "contents": [{"parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": encoded}}
+            ]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 180,
+                "responseMimeType": "application/json"
+            }
         }
         response = requests.post(
-            GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=25
+            GEMINI_URL, params={"key": GEMINI_API_KEY},
+            json=body, timeout=25
         )
         print("Gemini multi-product API status:", response.status_code)
         if response.status_code != 200:
-            print("Gemini multi-product API error:", response.text[:600])
+            print("Gemini multi-product API error:", response.text[:800])
             return []
         result = response.json()
         candidates = result.get("candidates") or []
         parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-        raw = " ".join(p.get("text", "") for p in parts).strip()
+        raw = " ".join(part.get("text", "") for part in parts).strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
-        match = re.search(r"\[[\s\S]*\]", raw)
-        if not match:
-            print("Gemini multi-product response was not a JSON array.")
-            return []
-        parsed = json.loads(match.group(0))
+        parsed = json.loads(raw)
         if not isinstance(parsed, list):
             return []
-        products, seen = [], set()
+        cleaned = []
         for item in parsed:
             if not isinstance(item, str):
                 continue
-            name = re.sub(r"\s+", " ", item).strip(" -:;,.")
-            if len(name) >= 3 and name.casefold() not in seen:
-                seen.add(name.casefold())
-                products.append(name[:60])
-            if len(products) >= 3:
+            name = re.sub(r"\s+", " ", item).strip(" \t\r\n-•")
+            if len(name) < 3:
+                continue
+            if name.lower() not in {x.lower() for x in cleaned}:
+                cleaned.append(name[:75])
+            if len(cleaned) >= max_products:
                 break
-        print("Gemini identified product count:", len(products))
-        return products
-    except Exception as exc:
-        print("Gemini multi-product visual analysis failed:", str(exc))
+        print("Gemini identified product count:", len(cleaned))
+        if cleaned:
+            print("Gemini identified product names:", " | ".join(cleaned))
+        return cleaned
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        print("Gemini multi-product analysis failed:", str(exc))
         return []
 
+
+def build_single_product_compare_url(title):
+    """Create the website URL for one product's eight store-search options."""
+    from urllib.parse import urlencode
+    base_url = (
+        os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+        or request.url_root.rstrip("/")
+    )
+    return base_url + "/compare?" + urlencode({
+        "title": str(title)[:160],
+        "search_all": "1",
+        "description": "Choose a store to search for this product."
+    })
+
+
+def make_multi_product_row(reel_id, product_names):
+    """Map up to three detected products to the existing Supabase schema."""
+    row = {"reel_id": str(reel_id)}
+    for index, name in enumerate(product_names[:3], start=1):
+        row[f"product_{index}_title"] = "Product: " + str(name)[:75]
+        row[f"product_{index}_url"] = build_single_product_compare_url(name)
+    return row
 
 def extract_shopping_links(text):
     found = []
@@ -450,45 +501,16 @@ def make_search_terms(text):
 
 
 def make_search_row(reel_id, terms):
-    """Store one identified product; /compare builds its eight store searches."""
-    clean_terms = re.sub(r"\s+", " ", str(terms or "")).strip()[:60]
-    query = quote_plus(clean_terms)
+    query = quote_plus(terms)
     return {
         "reel_id": str(reel_id),
-        "product_1_title": f"Search Amazon: {clean_terms}"[:80],
+        "product_1_title": f"Search Amazon: {terms}"[:80],
         "product_1_url": f"https://www.amazon.in/s?k={query}",
-        "product_2_title": None,
-        "product_2_url": None,
-        "product_3_title": None,
-        "product_3_url": None,
+        "product_2_title": f"Search Flipkart: {terms}"[:80],
+        "product_2_url": f"https://www.flipkart.com/search?q={query}",
+        "product_3_title": f"Search Google Shopping: {terms}"[:80],
+        "product_3_url": f"https://www.google.com/search?tbm=shop&q={query}",
     }
-
-
-def make_multi_search_row(reel_id, product_names):
-    """Store up to three distinct products using the existing Supabase columns."""
-    row = {
-        "reel_id": str(reel_id),
-        "product_1_title": None, "product_1_url": None,
-        "product_2_title": None, "product_2_url": None,
-        "product_3_title": None, "product_3_url": None,
-    }
-    cleaned, seen = [], set()
-    for name in product_names or []:
-        name = re.sub(r"\s+", " ", str(name or "")).strip(" -:;,.")
-        name = re.sub(r"^(product|item)\s*\d*\s*[:.-]?\s*", "", name, flags=re.I)
-        if len(name) < 3 or name.casefold() in seen:
-            continue
-        seen.add(name.casefold())
-        cleaned.append(name[:60])
-        if len(cleaned) >= 3:
-            break
-    if not cleaned:
-        return make_search_row(reel_id, "Product from Instagram")
-    for index, name in enumerate(cleaned, start=1):
-        query = quote_plus(name)
-        row[f"product_{index}_title"] = f"Search Amazon: {name}"[:80]
-        row[f"product_{index}_url"] = f"https://www.amazon.in/s?k={query}"
-    return row
 
 
 def make_product_row(reel_id, links, label):
@@ -681,7 +703,7 @@ def build_comparison_url(data):
 
 
 def send_product_buttons(recipient_id, data, skip_follow_check=False):
-    # Preserve existing follow-verification behavior.
+    """Send named, individual product cards; keep existing follow gate intact."""
     if not skip_follow_check and FOLLOW_CHECK_PAGE_TOKEN:
         status = get_follow_status(recipient_id)
         if status is not True:
@@ -695,32 +717,29 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
                 )
             return
 
-    # Send one clickable card per identified product, with its own comparison page.
-    product_cards = []
+    # New multi-product rows: each product has its own named card and its own
+    # comparison URL. The URL opens the eight-store chooser for that product.
+    card_elements = []
     for index in range(1, 4):
-        label = str(data.get(f"product_{index}_title") or "").strip()
-        if not label.lower().startswith("search amazon:"):
-            continue
-        product_name = re.sub(r"^Search Amazon:\s*", "", label, flags=re.I).strip()
-        if not product_name:
-            continue
-        single_product = {
-            "reel_id": data.get("reel_id", ""),
-            "product_1_title": f"Search Amazon: {product_name}"[:80],
-            "product_1_url": str(data.get(f"product_{index}_url") or ""),
-        }
-        compare_url = build_comparison_url(single_product)
-        product_cards.append({
-            "title": product_name[:80],
-            "subtitle": "Choose a store to shop this product",
-            "buttons": [{
-                "type": "web_url",
-                "url": compare_url,
-                "title": "Shop Now",
-            }],
-        })
+        raw_title = str(data.get(f"product_{index}_title") or "").strip()
+        url = str(data.get(f"product_{index}_url") or "").strip()
+        if raw_title.lower().startswith("product:") and url.startswith(("https://", "http://")):
+            title = raw_title.split(":", 1)[1].strip()[:80]
+            if not title:
+                continue
+            card_elements.append({
+                "title": title,
+                "subtitle": "Choose a store to shop this product",
+                "buttons": [{
+                    "type": "web_url",
+                    "url": url,
+                    "title": "Shop Now"
+                }]
+            })
 
-    if product_cards:
+    if card_elements:
+        # Instagram generic templates support a bounded number of elements.
+        # We currently save up to three product names in the existing schema.
         payload = {
             "recipient": {"id": recipient_id},
             "message": {
@@ -728,15 +747,49 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
                     "type": "template",
                     "payload": {
                         "template_type": "generic",
-                        "elements": product_cards[:3],
-                    },
+                        "elements": card_elements
+                    }
                 }
-            },
+            }
         }
         send_api_request(payload)
         return
 
-    # Preserve direct shopping links supplied by a user or Reel caption.
+    # Existing single-search rows should open the website instead of dumping
+    # eight long URLs into Instagram DM.
+    search_title = next(
+        (str(data.get(f"product_{i}_title") or "") for i in range(1, 4)
+         if str(data.get(f"product_{i}_title") or "").lower().startswith("search ")),
+        "",
+    )
+    if search_title and ":" in search_title:
+        terms = search_title.split(":", 1)[1].strip()[:60]
+        url = build_single_product_compare_url(terms)
+        payload = {
+            "recipient": {"id": recipient_id},
+            "message": {
+                "attachment": {
+                    "type": "template",
+                    "payload": {
+                        "template_type": "generic",
+                        "elements": [{
+                            "title": terms[:80],
+                            "subtitle": "Choose a store to shop this product",
+                            "buttons": [{
+                                "type": "web_url",
+                                "url": url,
+                                "title": "Shop Now"
+                            }]
+                        }]
+                    }
+                }
+            }
+        }
+        send_api_request(payload)
+        return
+
+    # Preserve legacy direct shopping-link handling for messages containing
+    # retailer URLs; these are not fabricated into AI product names.
     lines = ["🛍️ Product links", ""]
     count = 0
     for index in range(1, 4):
@@ -749,7 +802,6 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
         _send_text_in_chunks(recipient_id, "\n".join(lines), max_chars=850)
     else:
         send_simple_message(recipient_id, "Is Reel ke product links abhi available nahi hain.")
-
 
 def _send_text_in_chunks(recipient_id, text, max_chars=850):
     """Send line-by-line DM text in chunks below Instagram's 1000-char limit."""
@@ -799,4 +851,4 @@ def send_api_request(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-    
+            
