@@ -4,7 +4,7 @@ import html
 import base64
 import requests
 from urllib.parse import quote_plus, urlparse
-from flask import Flask, request
+from flask import Flask, request, send_file
 from supabase import create_client
 
 app = Flask(__name__)
@@ -48,6 +48,15 @@ def home():
 @app.route("/health", methods=["GET"])
 def health():
     return {"status": "ok"}, 200
+
+
+@app.route("/compare", methods=["GET"])
+def compare_page():
+    """Standalone premium product comparison landing page."""
+    landing_file = os.path.join(os.path.dirname(__file__), "find_my_product_landing.html")
+    if not os.path.isfile(landing_file):
+        return "Comparison page is not installed yet.", 404
+    return send_file(landing_file)
 
 
 @app.route("/webhook", methods=["GET", "POST"])
@@ -497,9 +506,45 @@ def verify_follow_and_unlock(sender_id):
         send_simple_message(sender_id, "Follow verified! Ab Reel dobara share karo, main product links bhej dunga.")
 
 
+def build_comparison_url(data):
+    """Build a URL for our own landing page, passing validated retailer URLs."""
+    title = ""
+    stores = {}
+    domain_to_store = (
+        ("amazon", ("amazon.", "amzn.to")),
+        ("flipkart", ("flipkart.com", "fkrt.it")),
+        ("meesho", ("meesho.com",)),
+        ("myntra", ("myntra.com",)),
+        ("ajio", ("ajio.com",)),
+        ("google", ("google.com", "google.co.in")),
+        ("nykaa", ("nykaa.com",)),
+        ("snapdeal", ("snapdeal.com",)),
+    )
+    for index in range(1, 4):
+        label = str(data.get(f"product_{index}_title") or "").strip()
+        url = str(data.get(f"product_{index}_url") or "").strip()
+        if not url.startswith(("https://", "http://")):
+            continue
+        if not title and label:
+            title = re.sub(r"^(Search (Amazon|Flipkart|Google Shopping):|Link from Reel caption/metadata|Shopping link from message|Shopping link found)\\s*", "", label, flags=re.I).strip()
+        host = (urlparse(url).hostname or "").lower()
+        matched = False
+        for store, domains in domain_to_store:
+            if any(domain in host for domain in domains):
+                stores.setdefault(store + "_url", url)
+                matched = True
+                break
+        if not matched:
+            stores.setdefault("extra_url", url)
+    if not title:
+        title = "Product from Instagram"
+    base = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/") or request.url_root.rstrip("/")
+    from urllib.parse import urlencode
+    return base + "/compare?" + urlencode({"title": title[:180], **stores})
+
+
 def send_product_buttons(recipient_id, data, skip_follow_check=False):
-    # Safe rollout: until the separate Page token is configured, preserve the
-    # existing bot behavior instead of accidentally blocking every customer.
+    # Keep existing follow-verification behavior unchanged.
     if not skip_follow_check and FOLLOW_CHECK_PAGE_TOKEN:
         status = get_follow_status(recipient_id)
         if status is not True:
@@ -512,28 +557,22 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
                     "Product links bhejne se pehle follow status verify karna zaroori hai, lekin Meta API check abhi fail ho raha hai. Admin ko FOLLOW_CHECK_PAGE_TOKEN aur permissions configure karni hongi. Links unlock nahi kiye gaye.",
                 )
             return
-    elements = []
-    for index in range(1, 4):
-        title = data.get(f"product_{index}_title")
-        product_url = data.get(f"product_{index}_url")
-        if title and product_url and str(product_url).startswith(("https://", "http://")):
-            elements.append({
-                "title": str(title)[:80],
-                "buttons": [{
-                    "type": "web_url",
-                    "url": str(product_url),
-                    "title": "Open Link" if str(title).startswith("Search ") else "Buy Now"
-                }]
-            })
-    if not elements:
-        send_simple_message(recipient_id, "Is Reel ke product links abhi available nahi hain.")
-        return
+
+    compare_url = build_comparison_url(data)
+    product_title = next((data.get(f"product_{i}_title") for i in range(1, 4) if data.get(f"product_{i}_title")), "Compare product stores")
     payload = {
         "recipient": {"id": recipient_id},
         "message": {
             "attachment": {
                 "type": "template",
-                "payload": {"template_type": "generic", "elements": elements}
+                "payload": {
+                    "template_type": "generic",
+                    "elements": [{
+                        "title": str(product_title)[:80],
+                        "subtitle": "Choose Amazon, Flipkart or another available store on our comparison page.",
+                        "buttons": [{"type": "web_url", "url": compare_url, "title": "Compare Stores"}]
+                    }]
+                }
             }
         }
     }
