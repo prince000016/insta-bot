@@ -163,9 +163,19 @@ def process_message_event(event):
 
         caption_text = " ".join(
             str(payload.get(key) or "")
-            for key in ("caption", "title", "text", "description")
+            for key in ("caption", "title", "text", "description", "permalink")
         ).strip()
         direct_links = extract_shopping_links(caption_text)
+        public_clues = ""
+        public_thumbnail = None
+        # Stage 2: inspect publicly available Reel metadata for extra text/link clues.
+        # This does not bypass private content or Instagram access restrictions.
+        if reel_url:
+            public_clues, page_product_links, public_thumbnail = inspect_public_reel_page(reel_url)
+            if not direct_links and page_product_links:
+                direct_links = page_product_links
+            if public_clues:
+                caption_text = (caption_text + " " + public_clues).strip()
 
         if not reel_id and reel_url:
             reel_id = extract_reel_id(reel_url)
@@ -209,7 +219,7 @@ def process_message_event(event):
             continue
 
         # Visual analysis only works when the webhook provides an accessible image URL.
-        image_url = find_image_url(payload)
+        image_url = find_image_url(payload) or public_thumbnail
         if not image_url and reel_url:
             image_url = discover_public_thumbnail(reel_url)
 
@@ -233,7 +243,13 @@ def process_message_event(event):
             send_product_buttons(sender_id, product_data)
         else:
             print("MULTI_PRODUCT_RESULT: 0; falling back to a single caption-based search.")
-            search_terms = visual_terms or make_search_terms(caption_text) or make_search_terms(payload.get("title") or "")
+            # Stage 4: combine all available text clues after visual detection.
+            # Emoji-only captions naturally yield no query; we never invent an exact product link.
+            search_terms = (
+                visual_terms
+                or make_search_terms(caption_text)
+                or make_search_terms(" ".join(str(payload.get(k) or "") for k in ("title", "caption", "description", "text")))
+            )
             if search_terms:
                 product_data = make_search_row(reel_id, search_terms)
                 save_products_to_db(product_data)
@@ -305,6 +321,53 @@ def discover_public_thumbnail(reel_url):
     except Exception as exc:
         print("Public thumbnail lookup failed:", str(exc))
     return None
+
+
+def inspect_public_reel_page(reel_url):
+    """Best-effort second-stage scan of public Reel HTML for captions and linked products.
+
+    Instagram may block anonymous requests or omit the creator's original product link.
+    Only inspect the public Instagram Reel URL; never treat generated store-search URLs as originals.
+    Returns (text_clues, original_shopping_links, thumbnail_url).
+    """
+    if not reel_url or not re.match(r"^https://(?:www\.)?instagram\.com/(?:reel|reels|p)/", reel_url):
+        return "", [], None
+    try:
+        response = requests.get(
+            reel_url, timeout=12,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            allow_redirects=True,
+        )
+        print("Public Reel detector stage status:", response.status_code)
+        if response.status_code != 200:
+            return "", [], None
+        page = response.text[:3_000_000]
+        clues = []
+        thumbnail = None
+        # Parse Open Graph metadata regardless of attribute order.
+        for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.I):
+            prop = re.search(r"(?:property|name)\s*=\s*[\"']([^\"']+)[\"']", tag, flags=re.I)
+            content = re.search(r"content\s*=\s*[\"']([^\"']*)[\"']", tag, flags=re.I)
+            if not prop or not content:
+                continue
+            key = prop.group(1).lower()
+            value = html.unescape(content.group(1)).replace("&amp;", "&").strip()
+            if key in ("og:title", "og:description", "twitter:title", "twitter:description") and value:
+                clues.append(value)
+            if key in ("og:image", "twitter:image") and value.startswith("https://") and not thumbnail:
+                thumbnail = value
+        # Public HTML may include outbound retailer URLs in metadata/embedded JSON.
+        links = extract_shopping_links(html.unescape(page).replace(r"\u0026", "&").replace(r"\/", "/"))
+        text_clues = " ".join(dict.fromkeys(clues))[:1200]
+        print("Public Reel metadata clues found:", bool(text_clues), "public retailer links found:", len(links), "thumbnail found:", bool(thumbnail))
+        return text_clues, links, thumbnail
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        print("Public Reel detector stage failed:", str(exc))
+        return "", [], None
 
 def find_image_url(payload):
     """Find image URLs only when Instagram actually includes one in the webhook payload."""
