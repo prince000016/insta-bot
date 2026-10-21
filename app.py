@@ -14,6 +14,13 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+# Separate Facebook Login Page token used ONLY for the follow-status check.
+FOLLOW_CHECK_PAGE_TOKEN = os.environ.get("FOLLOW_CHECK_PAGE_TOKEN", "").strip()
+FOLLOW_CHECK_API_URL = "https://graph.facebook.com/v26.0"
+FOLLOW_PAGE_URL = "https://www.instagram.com/find_myproduct52/"
+# Pending product results are kept until the user presses Verify Follow.
+# Note: in-memory pending requests are cleared by a server restart/redeploy.
+PENDING_FOLLOW_PRODUCTS = {}
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
@@ -74,6 +81,11 @@ def webhook():
 def process_message_event(event):
     sender = event.get("sender") or {}
     sender_id = sender.get("id")
+    # Handle the Verify Follow postback before normal message processing.
+    postback = event.get("postback") or {}
+    if sender_id and postback.get("payload") == "VERIFY_FOLLOW":
+        verify_follow_and_unlock(sender_id)
+        return
     message = event.get("message") or {}
     attachments = message.get("attachments") or []
 
@@ -95,6 +107,38 @@ def process_message_event(event):
     for attachment in attachments:
         attachment_type = attachment.get("type")
         payload = attachment.get("payload") or {}
+
+        # Reliable free visual route: process an actual image/screenshot sent in DM.
+        # A shared Reel webhook generally provides only the Reel URL, not its video frame.
+        if attachment_type == "image":
+            image_url = (
+                payload.get("url")
+                or payload.get("image_url")
+                or payload.get("thumbnail_url")
+            )
+            if not image_url:
+                print("Image attachment received without a usable URL.")
+                send_simple_message(
+                    sender_id,
+                    "Image mili, lekin uska direct URL nahi mila. Product ka clear screenshot/photo DM mein bhejo ya product ka naam likho."
+                )
+                continue
+            if not GEMINI_API_KEY:
+                print("Image attachment received but GEMINI_API_KEY is missing.")
+                send_simple_message(sender_id, "Gemini key configured nahi hai; product ka naam text mein bhej do.")
+                continue
+
+            visual_terms = identify_product_from_image_url(image_url)
+            if visual_terms:
+                print("Gemini identified product from DM image:", visual_terms[:160])
+                product_data = make_search_row(f"image-{sender_id}", visual_terms)
+                send_product_buttons(sender_id, product_data)
+            else:
+                send_simple_message(
+                    sender_id,
+                    "Image mil gayi, lekin product clear identify nahi hua. Product ka close-up screenshot bhejo ya naam text mein likho."
+                )
+            continue
 
         if attachment_type not in ("share", "ig_reel", "ig_post"):
             continue
@@ -381,7 +425,93 @@ def save_products_to_db(data):
         return False
 
 
-def send_product_buttons(recipient_id, data):
+def get_follow_status(sender_id):
+    """Return True/False only when Meta confirms status; None means API unavailable."""
+    if not FOLLOW_CHECK_PAGE_TOKEN:
+        print("FOLLOW_CHECK_PAGE_TOKEN is not configured; cannot verify follow status.")
+        return None
+    try:
+        response = requests.get(
+            f"{FOLLOW_CHECK_API_URL}/{sender_id}",
+            params={
+                "fields": "is_user_follow_business",
+                "access_token": FOLLOW_CHECK_PAGE_TOKEN,
+            },
+            timeout=12,
+        )
+        print("Follow-check API status:", response.status_code)
+        if response.status_code != 200:
+            print("Follow-check API error:", response.text[:1000])
+            return None
+        result = response.json()
+        value = result.get("is_user_follow_business")
+        if isinstance(value, bool):
+            return value
+        print("Follow-check API did not return is_user_follow_business.")
+    except (requests.RequestException, ValueError) as exc:
+        print("Follow-check API request failed:", str(exc))
+    return None
+
+
+def send_follow_gate(recipient_id):
+    """Show Follow and Verify buttons; never unlock links without API confirmation."""
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {
+            "attachment": {
+                "type": "template",
+                "payload": {
+                    "template_type": "generic",
+                    "elements": [{
+                        "title": "Follow to unlock product links",
+                        "subtitle": "Follow @find_myproduct52, then tap Verify Follow.",
+                        "buttons": [
+                            {"type": "web_url", "url": FOLLOW_PAGE_URL, "title": "Follow Page"},
+                            {"type": "postback", "title": "Verify Follow", "payload": "VERIFY_FOLLOW"},
+                        ],
+                    }],
+                },
+            }
+        },
+    }
+    send_api_request(payload)
+
+
+def verify_follow_and_unlock(sender_id):
+    status = get_follow_status(sender_id)
+    if status is None:
+        send_simple_message(
+            sender_id,
+            "Follow verification abhi available nahi hai. Admin ko Render mein FOLLOW_CHECK_PAGE_TOKEN configure karna aur Meta API access confirm karna hoga. Product links abhi unlock nahi kiye gaye.",
+        )
+        return
+    if not status:
+        send_simple_message(sender_id, "Abhi follow confirm nahi hua. @find_myproduct52 ko follow karke Verify Follow dobara dabao.")
+        send_follow_gate(sender_id)
+        return
+    product_data = PENDING_FOLLOW_PRODUCTS.pop(str(sender_id), None)
+    if product_data:
+        send_simple_message(sender_id, "Follow verified! Ye rahe tumhare product links 👇")
+        send_product_buttons(sender_id, product_data, skip_follow_check=True)
+    else:
+        send_simple_message(sender_id, "Follow verified! Ab Reel dobara share karo, main product links bhej dunga.")
+
+
+def send_product_buttons(recipient_id, data, skip_follow_check=False):
+    # Safe rollout: until the separate Page token is configured, preserve the
+    # existing bot behavior instead of accidentally blocking every customer.
+    if not skip_follow_check and FOLLOW_CHECK_PAGE_TOKEN:
+        status = get_follow_status(recipient_id)
+        if status is not True:
+            PENDING_FOLLOW_PRODUCTS[str(recipient_id)] = data
+            if status is False:
+                send_follow_gate(recipient_id)
+            else:
+                send_simple_message(
+                    recipient_id,
+                    "Product links bhejne se pehle follow status verify karna zaroori hai, lekin Meta API check abhi fail ho raha hai. Admin ko FOLLOW_CHECK_PAGE_TOKEN aur permissions configure karni hongi. Links unlock nahi kiye gaye.",
+                )
+            return
     elements = []
     for index in range(1, 4):
         title = data.get(f"product_{index}_title")
@@ -437,4 +567,4 @@ def send_api_request(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-        
+    
