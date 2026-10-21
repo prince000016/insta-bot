@@ -2,6 +2,7 @@ import os
 import re
 import html
 import base64
+import json
 import requests
 from urllib.parse import quote_plus, urlparse
 from flask import Flask, request, send_file
@@ -106,7 +107,7 @@ def process_message_event(event):
     if text_content:
         direct_links = extract_shopping_links(text_content)
         if direct_links:
-            send_links_as_buttons(sender_id, direct_links, make_search_terms(text_content) or "Product from Instagram")
+            send_links_as_buttons(sender_id, direct_links, "Shopping link from message")
             return
 
     if not attachments:
@@ -137,10 +138,11 @@ def process_message_event(event):
                 send_simple_message(sender_id, "Gemini key configured nahi hai; product ka naam text mein bhej do.")
                 continue
 
-            visual_terms = identify_product_from_image_url(image_url)
-            if visual_terms:
-                print("Gemini identified product from DM image:", visual_terms[:160])
-                product_data = make_search_row(f"image-{sender_id}", visual_terms)
+            visual_products = identify_products_from_image_url(image_url)
+            if visual_products:
+                print("Gemini identified products from DM image:", visual_products)
+                product_data = make_multi_search_row(f"image-{sender_id}", visual_products)
+                save_products_to_db(product_data)
                 send_product_buttons(sender_id, product_data)
             else:
                 send_simple_message(
@@ -171,7 +173,7 @@ def process_message_event(event):
         if not reel_id:
             print("Reel ID could not be extracted:", payload)
             if direct_links:
-                send_links_as_buttons(sender_id, direct_links, make_search_terms(caption_text) or "Product from Reel")
+                send_links_as_buttons(sender_id, direct_links, "Shopping link found")
             else:
                 send_simple_message(
                     sender_id,
@@ -189,7 +191,7 @@ def process_message_event(event):
 
         # If the webhook includes a real shopping link, use it.
         if direct_links:
-            product_data = make_product_row(reel_id, direct_links, make_search_terms(caption_text) or "Product from Reel")
+            product_data = make_product_row(reel_id, direct_links, "Link from Reel caption/metadata")
             save_products_to_db(product_data)
             send_product_buttons(sender_id, product_data)
             continue
@@ -199,26 +201,31 @@ def process_message_event(event):
         if not image_url and reel_url:
             image_url = discover_public_thumbnail(reel_url)
 
-        visual_terms = ""
+        visual_products = []
         if image_url and GEMINI_API_KEY:
-            visual_terms = identify_product_from_image_url(image_url)
+            visual_products = identify_products_from_image_url(image_url)
         elif image_url and not GEMINI_API_KEY:
             print("Image URL present but GEMINI_API_KEY is missing.")
         else:
             print("No accessible thumbnail found; continuing with caption/title fallback.")
 
-        search_terms = visual_terms or make_search_terms(caption_text) or make_search_terms(payload.get("title") or "")
-        if search_terms:
-            product_data = make_search_row(reel_id, search_terms)
+        if visual_products:
+            product_data = make_multi_search_row(reel_id, visual_products)
             save_products_to_db(product_data)
             send_product_buttons(sender_id, product_data)
         else:
-            print("No visual details or caption/product keywords available for Reel ID:", reel_id)
-            send_simple_message(
-                sender_id,
-                "Reel mil gayi, lekin product identify karne ke liye caption ya accessible thumbnail nahi mila. "
-                "Product ka naam/caption bhej do, main shopping-search links bana dunga."
-            )
+            search_terms = make_search_terms(caption_text) or make_search_terms(payload.get("title") or "")
+            if search_terms:
+                product_data = make_search_row(reel_id, search_terms)
+                save_products_to_db(product_data)
+                send_product_buttons(sender_id, product_data)
+            else:
+                print("No visual details or caption/product keywords available for Reel ID:", reel_id)
+                send_simple_message(
+                    sender_id,
+                    "Reel mil gayi, lekin product identify karne ke liye caption ya accessible thumbnail nahi mila. "
+                    "Product ka naam/caption bhej do, main shopping-search links bana dunga."
+                )
 
 
 def extract_reel_id(url):
@@ -251,9 +258,9 @@ def discover_public_thumbnail(reel_url):
 
         page = response.text[:2000000]
         # Inspect each meta tag and read its property/name and content attributes.
-        for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.IGNORECASE):
-            key_match = re.search(r"""(?:property|name)\s*=\s*["'](og:image|twitter:image)["']""", tag, flags=re.IGNORECASE)
-            value_match = re.search(r"""content\s*=\s*["']([^"']+)["']""", tag, flags=re.IGNORECASE)
+        for tag in re.findall(r"<meta\\b[^>]*>", page, flags=re.IGNORECASE):
+            key_match = re.search(r"""(?:property|name)\\s*=\\s*["'](og:image|twitter:image)["']""", tag, flags=re.IGNORECASE)
+            value_match = re.search(r"""content\\s*=\\s*["']([^"']+)["']""", tag, flags=re.IGNORECASE)
             if key_match and value_match:
                 candidate = html.unescape(value_match.group(1)).replace("&amp;", "&")
                 if candidate.startswith("https://"):
@@ -338,6 +345,72 @@ def identify_product_from_image_url(image_url):
     return ""
 
 
+def identify_products_from_image_url(image_url):
+    """Identify up to three distinct purchasable products visible in an accessible image."""
+    if not GEMINI_API_KEY or not image_url:
+        return []
+    try:
+        image_response = requests.get(image_url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        image_response.raise_for_status()
+        content_type = image_response.headers.get("Content-Type", "").split(";")[0].lower()
+        if not content_type.startswith("image/") or len(image_response.content) > 8 * 1024 * 1024:
+            print("Multi-product analysis skipped: unsupported image response.")
+            return []
+        mime_type = content_type if content_type in (
+            "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"
+        ) else "image/jpeg"
+        encoded = base64.b64encode(image_response.content).decode("ascii")
+        body = {
+            "contents": [{
+                "parts": [
+                    {"text": (
+                        "Identify up to 3 distinct purchasable products clearly visible in this image. "
+                        "Return ONLY a JSON array of short shopping search names, for example "
+                        '[\"Beardo Godfather perfume\", \"Ajmal Oud perfume\"]. '
+                        "Use brand/model only if readable or confidently identifiable. Do not invent products. "
+                        "If no product is identifiable, return []."
+                    )},
+                    {"inline_data": {"mime_type": mime_type, "data": encoded}},
+                ]
+            }],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 150},
+        }
+        response = requests.post(
+            GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=25
+        )
+        print("Gemini multi-product API status:", response.status_code)
+        if response.status_code != 200:
+            print("Gemini multi-product API error:", response.text[:600])
+            return []
+        result = response.json()
+        candidates = result.get("candidates") or []
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        raw = " ".join(p.get("text", "") for p in parts).strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+        match = re.search(r"\[[\s\S]*\]", raw)
+        if not match:
+            print("Gemini multi-product response was not a JSON array.")
+            return []
+        parsed = json.loads(match.group(0))
+        if not isinstance(parsed, list):
+            return []
+        products, seen = [], set()
+        for item in parsed:
+            if not isinstance(item, str):
+                continue
+            name = re.sub(r"\s+", " ", item).strip(" -:;,.")
+            if len(name) >= 3 and name.casefold() not in seen:
+                seen.add(name.casefold())
+                products.append(name[:60])
+            if len(products) >= 3:
+                break
+        print("Gemini identified product count:", len(products))
+        return products
+    except Exception as exc:
+        print("Gemini multi-product visual analysis failed:", str(exc))
+        return []
+
+
 def extract_shopping_links(text):
     found = []
     for raw_url in URL_RE.findall(text or ""):
@@ -359,9 +432,9 @@ def make_search_terms(text):
     cleaned = re.sub(r"@\w+|#[\w.]+", " ", cleaned)
     # Remove common creator/engagement/CTA phrases that are not product details.
     noise = re.compile(
-        r"\b(link in bio|follow for more|follow me|comment below|comment for the links|comment for links|for the links|save this|share this|"
+        r"\b(link in bio|follow for more|follow me|comment below|save this|share this|"
         r"dm me|dm for link|want to buy this look|shop this look|how to style|"
-        r"viral|trending now|must have|must-have|check my bio|use code|limited offer|got this|got thi|"
+        r"viral|trending now|must have|must-have|check my bio|use code|limited offer|"
         r"tag someone|which one|rate this|part \d+)\b", re.I
     )
     cleaned = noise.sub(" ", cleaned)
@@ -377,27 +450,51 @@ def make_search_terms(text):
 
 
 def make_search_row(reel_id, terms):
-    query = quote_plus(terms)
+    """Store one identified product; /compare builds its eight store searches."""
+    clean_terms = re.sub(r"\s+", " ", str(terms or "")).strip()[:60]
+    query = quote_plus(clean_terms)
     return {
         "reel_id": str(reel_id),
-        "product_1_title": f"Search Amazon: {terms}"[:80],
+        "product_1_title": f"Search Amazon: {clean_terms}"[:80],
         "product_1_url": f"https://www.amazon.in/s?k={query}",
-        "product_2_title": f"Search Flipkart: {terms}"[:80],
-        "product_2_url": f"https://www.flipkart.com/search?q={query}",
-        "product_3_title": f"Search Google Shopping: {terms}"[:80],
-        "product_3_url": f"https://www.google.com/search?tbm=shop&q={query}",
+        "product_2_title": None,
+        "product_2_url": None,
+        "product_3_title": None,
+        "product_3_url": None,
     }
 
 
+def make_multi_search_row(reel_id, product_names):
+    """Store up to three distinct products using the existing Supabase columns."""
+    row = {
+        "reel_id": str(reel_id),
+        "product_1_title": None, "product_1_url": None,
+        "product_2_title": None, "product_2_url": None,
+        "product_3_title": None, "product_3_url": None,
+    }
+    cleaned, seen = [], set()
+    for name in product_names or []:
+        name = re.sub(r"\s+", " ", str(name or "")).strip(" -:;,.")
+        name = re.sub(r"^(product|item)\s*\d*\s*[:.-]?\s*", "", name, flags=re.I)
+        if len(name) < 3 or name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        cleaned.append(name[:60])
+        if len(cleaned) >= 3:
+            break
+    if not cleaned:
+        return make_search_row(reel_id, "Product from Instagram")
+    for index, name in enumerate(cleaned, start=1):
+        query = quote_plus(name)
+        row[f"product_{index}_title"] = f"Search Amazon: {name}"[:80]
+        row[f"product_{index}_url"] = f"https://www.amazon.in/s?k={query}"
+    return row
+
+
 def make_product_row(reel_id, links, label):
-    """Store the detected product label with up to three real shopping URLs."""
     row = {"reel_id": str(reel_id)}
-    clean_label = make_search_terms(label) or str(label or "Product from Instagram").strip()
-    if clean_label.lower() in {"shopping link from message", "shopping link found", "link from reel caption metadata", "product from reel"}:
-        clean_label = "Product from Instagram"
-    clean_label = clean_label[:65] or "Product from Instagram"
     for index, link in enumerate(links[:3], start=1):
-        row[f"product_{index}_title"] = clean_label[:80]
+        row[f"product_{index}_title"] = f"{label} {index}"[:80]
         row[f"product_{index}_url"] = link
     return row
 
@@ -526,79 +623,65 @@ def verify_follow_and_unlock(sender_id):
 
 
 def build_comparison_url(data):
-    """Build the store-picker URL. Search links are always present; known direct links override them."""
+    """Build the comparison page URL; search rows populate all supported stores."""
+    title = ""
+    stores = {}
+    domain_to_store = (
+        ("amazon", ("amazon.", "amzn.to")),
+        ("flipkart", ("flipkart.com", "fkrt.it")),
+        ("meesho", ("meesho.com",)),
+        ("myntra", ("myntra.com",)),
+        ("ajio", ("ajio.com",)),
+        ("google", ("google.com", "google.co.in")),
+        ("nykaa", ("nykaa.com",)),
+        ("snapdeal", ("snapdeal.com",)),
+    )
     labels = []
-    direct_urls = []
+    urls = []
     for index in range(1, 4):
         label = str(data.get(f"product_{index}_title") or "").strip()
         url = str(data.get(f"product_{index}_url") or "").strip()
         if label:
             labels.append(label)
         if url.startswith(("https://", "http://")):
-            direct_urls.append((label, url))
-
-    # Bot-generated search rows carry the clean query in "Search Amazon: ...".
+            urls.append((label, url))
+    # Search rows are generated by this bot and should create searches for every store.
     search_label = next((x for x in labels if x.lower().startswith("search amazon:")), "")
     if search_label:
         title = re.sub(r"^Search Amazon:\s*", "", search_label, flags=re.I).strip()
-    else:
-        title = next((x for x in labels if x), "Product from Instagram")
-        title = re.sub(r"^(Link from Reel caption/metadata|Shopping link from message|Shopping link found)\s*\d*:?\s*", "", title, flags=re.I).strip()
-        title = make_search_terms(title) or title
-    title = (title or "Product from Instagram")[:100]
-    q = quote_plus(title)
-
-    stores = {
-        "amazon_url": f"https://www.amazon.in/s?k={q}",
-        "flipkart_url": f"https://www.flipkart.com/search?q={q}",
-        "meesho_url": f"https://www.meesho.com/search?q={q}",
-        "myntra_url": f"https://www.myntra.com/{q.replace('+', '-')}",
-        "ajio_url": f"https://www.ajio.com/search/?text={q}",
-        "nykaa_url": f"https://www.nykaa.com/search/result/?q={q}",
-        "snapdeal_url": f"https://www.snapdeal.com/search?keyword={q}",
-        "google_url": f"https://www.google.com/search?tbm=shop&q={q}",
-    }
-    domain_to_store = (
-        ("amazon_url", ("amazon.", "amzn.to")),
-        ("flipkart_url", ("flipkart.com", "fkrt.it")),
-        ("meesho_url", ("meesho.com",)),
-        ("myntra_url", ("myntra.com",)),
-        ("ajio_url", ("ajio.com",)),
-        ("nykaa_url", ("nykaa.com",)),
-        ("snapdeal_url", ("snapdeal.com",)),
-        ("google_url", ("google.com", "google.co.in")),
-    )
-    # Prefer actual product URLs when the Reel/message supplied one for that store.
-    for _label, url in direct_urls:
-        host = (urlparse(url).hostname or "").lower()
-        for store_key, domains in domain_to_store:
-            if any(domain in host for domain in domains):
-                stores[store_key] = url
-                break
-
-    base_url = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/") or request.url_root.rstrip("/")
-    from urllib.parse import urlencode
-    comparison_url = base_url + "/compare?" + urlencode({"title": title, **stores})
-    # Instagram button URLs have practical length limits. If long affiliate/direct URLs
-    # make the destination too long, keep the product query and use store search URLs.
-    if len(comparison_url) > 1800:
-        search_only = {
+        q = quote_plus(title)
+        stores = {
             "amazon_url": f"https://www.amazon.in/s?k={q}",
             "flipkart_url": f"https://www.flipkart.com/search?q={q}",
             "meesho_url": f"https://www.meesho.com/search?q={q}",
             "myntra_url": f"https://www.myntra.com/{q.replace('+', '-')}",
             "ajio_url": f"https://www.ajio.com/search/?text={q}",
+            "google_url": f"https://www.google.com/search?tbm=shop&q={q}",
             "nykaa_url": f"https://www.nykaa.com/search/result/?q={q}",
             "snapdeal_url": f"https://www.snapdeal.com/search?keyword={q}",
-            "google_url": f"https://www.google.com/search?tbm=shop&q={q}",
         }
-        comparison_url = base_url + "/compare?" + urlencode({"title": title, **search_only})
-    return comparison_url
+    else:
+        for label, url in urls:
+            if not title and label:
+                title = re.sub(r"^(Link from Reel caption/metadata|Shopping link from message|Shopping link found)\s*", "", label, flags=re.I).strip()
+            host = (urlparse(url).hostname or "").lower()
+            matched = False
+            for store, domains in domain_to_store:
+                if any(domain in host for domain in domains):
+                    stores.setdefault(store + "_url", url)
+                    matched = True
+                    break
+            if not matched:
+                stores.setdefault("extra_url", url)
+        if not title:
+            title = "Product from Instagram"
+    base_url = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/") or request.url_root.rstrip("/")
+    from urllib.parse import urlencode
+    return base_url + "/compare?" + urlencode({"title": title[:180], **stores})
 
 
 def send_product_buttons(recipient_id, data, skip_follow_check=False):
-    """Send one Link-Plox-style DM card; its button opens the store picker website."""
-    # Preserve the existing follow-verification behavior.
+    # Preserve existing follow-verification behavior.
     if not skip_follow_check and FOLLOW_CHECK_PAGE_TOKEN:
         status = get_follow_status(recipient_id)
         if status is not True:
@@ -612,39 +695,60 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
                 )
             return
 
-    comparison_url = build_comparison_url(data)
-    title = ""
+    # Send one clickable card per identified product, with its own comparison page.
+    product_cards = []
     for index in range(1, 4):
-        candidate = str(data.get(f"product_{index}_title") or "").strip()
-        if candidate:
-            title = candidate
-            break
-    title = re.sub(r"^Search Amazon:\s*", "", title, flags=re.I).strip()
-    title = re.sub(r"^(Link from Reel caption/metadata|Shopping link from message|Shopping link found)\s*\d*:?\s*", "", title, flags=re.I).strip()
-    title = make_search_terms(title) or title or "Product from your Reel"
+        label = str(data.get(f"product_{index}_title") or "").strip()
+        if not label.lower().startswith("search amazon:"):
+            continue
+        product_name = re.sub(r"^Search Amazon:\s*", "", label, flags=re.I).strip()
+        if not product_name:
+            continue
+        single_product = {
+            "reel_id": data.get("reel_id", ""),
+            "product_1_title": f"Search Amazon: {product_name}"[:80],
+            "product_1_url": str(data.get(f"product_{index}_url") or ""),
+        }
+        compare_url = build_comparison_url(single_product)
+        product_cards.append({
+            "title": product_name[:80],
+            "subtitle": "Choose a store to shop this product",
+            "buttons": [{
+                "type": "web_url",
+                "url": compare_url,
+                "title": "Shop Now",
+            }],
+        })
 
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {
-            "attachment": {
-                "type": "template",
-                "payload": {
-                    "template_type": "generic",
-                    "elements": [{
-                        "title": title[:80],
-                        "subtitle": "Choose a store to shop this product",
-                        "buttons": [{
-                            "type": "web_url",
-                            "url": comparison_url,
-                            "title": "Shop Now",
-                        }],
-                    }],
-                },
-            }
-        },
-    }
-    print("Sending product card; product title:", title[:80])
-    send_api_request(payload)
+    if product_cards:
+        payload = {
+            "recipient": {"id": recipient_id},
+            "message": {
+                "attachment": {
+                    "type": "template",
+                    "payload": {
+                        "template_type": "generic",
+                        "elements": product_cards[:3],
+                    },
+                }
+            },
+        }
+        send_api_request(payload)
+        return
+
+    # Preserve direct shopping links supplied by a user or Reel caption.
+    lines = ["🛍️ Product links", ""]
+    count = 0
+    for index in range(1, 4):
+        title = str(data.get(f"product_{index}_title") or "").strip()
+        url = str(data.get(f"product_{index}_url") or "").strip()
+        if title and url.startswith(("https://", "http://")):
+            count += 1
+            lines.append(f"{count}. {title[:55]}: {url}")
+    if count:
+        _send_text_in_chunks(recipient_id, "\n".join(lines), max_chars=850)
+    else:
+        send_simple_message(recipient_id, "Is Reel ke product links abhi available nahi hain.")
 
 
 def _send_text_in_chunks(recipient_id, text, max_chars=850):
@@ -695,4 +799,4 @@ def send_api_request(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-                     
+    
