@@ -727,7 +727,7 @@ def build_comparison_url(data):
 
 def send_product_buttons(recipient_id, data, skip_follow_check=False):
     """Send named, individual product cards; keep existing follow gate intact."""
-    if not skip_follow_check and FOLLOW_CHECK_PAGE_TOKEN:
+    if not skip_follow_check and FOLLOW_CHECK_IG_TOKEN:
         status = get_follow_status(recipient_id)
         if status is not True:
             PENDING_FOLLOW_PRODUCTS[str(recipient_id)] = data
