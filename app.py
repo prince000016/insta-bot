@@ -2,6 +2,7 @@ import os
 import re
 import html
 import base64
+import json
 import requests
 from urllib.parse import quote_plus, urlparse
 from flask import Flask, request, send_file
@@ -14,9 +15,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-# Separate Facebook Login Page token used ONLY for the follow-status check.
-FOLLOW_CHECK_PAGE_TOKEN = os.environ.get("FOLLOW_CHECK_PAGE_TOKEN", "").strip()
-FOLLOW_CHECK_API_URL = "https://graph.facebook.com/v26.0"
+# Separate Instagram Login user token used ONLY for follow-status checks.
+# Do not put a Facebook Page token in this variable.
+FOLLOW_CHECK_IG_TOKEN = os.environ.get("FOLLOW_CHECK_IG_TOKEN", "").strip()
+FOLLOW_CHECK_API_URL = "https://graph.instagram.com/v26.0"
 FOLLOW_PAGE_URL = "https://www.instagram.com/find_myproduct52/"
 # Pending product results are kept until the user presses Verify Follow.
 # Note: in-memory pending requests are cleared by a server restart/redeploy.
@@ -590,16 +592,19 @@ def save_products_to_db(data):
 
 
 def get_follow_status(sender_id):
-    """Return True/False only when Meta confirms status; None means API unavailable."""
-    if not FOLLOW_CHECK_PAGE_TOKEN:
-        print("FOLLOW_CHECK_PAGE_TOKEN is not configured; cannot verify follow status.")
+    """Return True/False only when Instagram Login API confirms status; None means unavailable."""
+    if not FOLLOW_CHECK_IG_TOKEN:
+        print(
+            "FOLLOW_CHECK_IG_TOKEN is missing. Follow verification needs an Instagram Login "
+            "user token with instagram_business_manage_messages; Page tokens are not valid here."
+        )
         return None
     try:
         response = requests.get(
             f"{FOLLOW_CHECK_API_URL}/{sender_id}",
             params={
                 "fields": "is_user_follow_business",
-                "access_token": FOLLOW_CHECK_PAGE_TOKEN,
+                "access_token": FOLLOW_CHECK_IG_TOKEN,
             },
             timeout=12,
         )
@@ -610,8 +615,9 @@ def get_follow_status(sender_id):
         result = response.json()
         value = result.get("is_user_follow_business")
         if isinstance(value, bool):
+            print("Follow-check result returned a boolean.")
             return value
-        print("Follow-check API did not return is_user_follow_business.")
+        print("Follow-check API did not return a boolean is_user_follow_business field.")
     except (requests.RequestException, ValueError) as exc:
         print("Follow-check API request failed:", str(exc))
     return None
@@ -646,7 +652,7 @@ def verify_follow_and_unlock(sender_id):
     if status is None:
         send_simple_message(
             sender_id,
-            "Follow verification abhi available nahi hai. Admin ko Render mein FOLLOW_CHECK_PAGE_TOKEN configure karna aur Meta API access confirm karna hoga. Product links abhi unlock nahi kiye gaye.",
+            "Follow verification abhi available nahi hai. Admin ko Instagram Login token (FOLLOW_CHECK_IG_TOKEN) aur instagram_business_manage_messages permission configure karni hogi. Product links abhi unlock nahi kiye gaye.",
         )
         return
     if not status:
@@ -730,7 +736,7 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
             else:
                 send_simple_message(
                     recipient_id,
-                    "Product links bhejne se pehle follow status verify karna zaroori hai, lekin Meta API check abhi fail ho raha hai. Admin ko FOLLOW_CHECK_PAGE_TOKEN aur permissions configure karni hongi. Links unlock nahi kiye gaye.",
+                    "Product links bhejne se pehle follow status verify karna zaroori hai, lekin Instagram follow-check API abhi fail ho rahi hai. Admin ko Instagram Login token (FOLLOW_CHECK_IG_TOKEN) aur permissions check karni hongi. Links unlock nahi kiye gaye.",
                 )
             return
 
@@ -868,4 +874,4 @@ def send_api_request(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-            
+    
