@@ -222,13 +222,15 @@ def process_message_event(event):
         elif image_url and not GEMINI_API_KEY:
             print("Image URL present but GEMINI_API_KEY is missing.")
         else:
-            print("No accessible thumbnail found; continuing with caption/title fallback.")
+            print("MULTI_PRODUCT_BLOCKED: no accessible Reel thumbnail; caption-only fallback will be used.")
 
         if visual_products:
+            print("MULTI_PRODUCT_RESULT:", len(visual_products), visual_products)
             product_data = make_multi_product_row(reel_id, visual_products)
             save_products_to_db(product_data)
             send_product_buttons(sender_id, product_data)
         else:
+            print("MULTI_PRODUCT_RESULT: 0; falling back to a single caption-based search.")
             search_terms = visual_terms or make_search_terms(caption_text) or make_search_terms(payload.get("title") or "")
             if search_terms:
                 product_data = make_search_row(reel_id, search_terms)
@@ -257,35 +259,50 @@ def extract_reel_id(url):
 
 
 def discover_public_thumbnail(reel_url):
-    """Best-effort lookup of a public Reel page's Open Graph image."""
-    if not reel_url or not reel_url.startswith("https://www.instagram.com/"):
+    """Best-effort public Reel thumbnail lookup; Instagram may block unauthenticated access."""
+    if not reel_url or not re.match(r"^https://(?:www\.)?instagram\.com/(?:reel|reels|p)/", reel_url):
         return None
     try:
         response = requests.get(
-            reel_url,
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36"},
+            reel_url, timeout=12,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
             allow_redirects=True,
         )
         print("Public Reel page status:", response.status_code)
         if response.status_code != 200:
+            print("Public Reel thumbnail unavailable: Instagram returned non-200.")
             return None
-
-        page = response.text[:2000000]
-        # Inspect each meta tag and read its property/name and content attributes.
-        for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.IGNORECASE):
-            key_match = re.search(r"""(?:property|name)\s*=\s*["'](og:image|twitter:image)["']""", tag, flags=re.IGNORECASE)
-            value_match = re.search(r"""content\s*=\s*["']([^"']+)["']""", tag, flags=re.IGNORECASE)
-            if key_match and value_match:
-                candidate = html.unescape(value_match.group(1)).replace("&amp;", "&")
+        page = response.text[:3_000_000]
+        # First pass: Open Graph / Twitter meta tags (attribute order may vary).
+        for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.I):
+            property_match = re.search(r"""(?:property|name)\s*=\s*["'](?:og:image|twitter:image)["']""", tag, flags=re.I)
+            content_match = re.search(r"""content\s*=\s*["']([^"']+)["']""", tag, flags=re.I)
+            if property_match and content_match:
+                candidate = html.unescape(content_match.group(1)).replace("&amp;", "&")
                 if candidate.startswith("https://"):
                     print("Public Reel thumbnail metadata found.")
                     return candidate
-        print("No og:image/twitter:image found in public Reel page.")
+        # Second pass: JSON-embedded thumbnail_url / display_url values.
+        patterns = [
+            r'"thumbnail_url"\s*:\s*"([^"]+)"',
+            r'"display_url"\s*:\s*"([^"]+)"',
+            r'"og:image"\s*content="([^"]+)"',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, page)
+            if match:
+                candidate = html.unescape(match.group(1)).replace(r"\u0026", "&").replace(r"\/", "/")
+                if candidate.startswith("https://"):
+                    print("Public Reel thumbnail found in embedded page data.")
+                    return candidate
+        print("No accessible public Reel thumbnail found.")
     except Exception as exc:
         print("Public thumbnail lookup failed:", str(exc))
     return None
-
 
 def find_image_url(payload):
     """Find image URLs only when Instagram actually includes one in the webhook payload."""
@@ -386,12 +403,12 @@ def identify_products_from_image_url(image_url, max_products=3):
         ) else "image/jpeg"
         encoded = base64.b64encode(image_response.content).decode("ascii")
         prompt = (
-            "Identify distinct consumer products clearly visible in this image. "
+            "Identify each distinct physical product/item visibly shown in this image, not just the overall category. "
             "Return ONLY a JSON array of 1 to " + str(max_products) + " short product search names. "
             "Include brand/model only when readable or clearly recognizable; do not invent brands. "
-            "Do not return people, captions, hashtags, generic marketing phrases, or duplicate variants. "
+            "For a lineup/display containing several different bottles/items, return each distinct visible item separately. ""Do not return people, captions, hashtags, generic marketing phrases, or duplicate variants. "
             "If the image does not show a clearly identifiable product, return []. "
-            'Example: ["Beardo Godfather perfume", "Beardo Toxic perfume"]'
+            'Example: ["Beardo Godfather perfume", "Beardo Daddy perfume", "Beardo Toxic perfume"]'
         )
         body = {
             "contents": [{"parts": [
