@@ -106,7 +106,7 @@ def process_message_event(event):
     if text_content:
         direct_links = extract_shopping_links(text_content)
         if direct_links:
-            send_links_as_buttons(sender_id, direct_links, "Shopping link from message")
+            send_links_as_buttons(sender_id, direct_links, make_search_terms(text_content) or "Product from Instagram")
             return
 
     if not attachments:
@@ -171,7 +171,7 @@ def process_message_event(event):
         if not reel_id:
             print("Reel ID could not be extracted:", payload)
             if direct_links:
-                send_links_as_buttons(sender_id, direct_links, "Shopping link found")
+                send_links_as_buttons(sender_id, direct_links, make_search_terms(caption_text) or "Product from Reel")
             else:
                 send_simple_message(
                     sender_id,
@@ -189,7 +189,7 @@ def process_message_event(event):
 
         # If the webhook includes a real shopping link, use it.
         if direct_links:
-            product_data = make_product_row(reel_id, direct_links, "Link from Reel caption/metadata")
+            product_data = make_product_row(reel_id, direct_links, make_search_terms(caption_text) or "Product from Reel")
             save_products_to_db(product_data)
             send_product_buttons(sender_id, product_data)
             continue
@@ -251,9 +251,9 @@ def discover_public_thumbnail(reel_url):
 
         page = response.text[:2000000]
         # Inspect each meta tag and read its property/name and content attributes.
-        for tag in re.findall(r"<meta\\b[^>]*>", page, flags=re.IGNORECASE):
-            key_match = re.search(r"""(?:property|name)\\s*=\\s*["'](og:image|twitter:image)["']""", tag, flags=re.IGNORECASE)
-            value_match = re.search(r"""content\\s*=\\s*["']([^"']+)["']""", tag, flags=re.IGNORECASE)
+        for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.IGNORECASE):
+            key_match = re.search(r"""(?:property|name)\s*=\s*["'](og:image|twitter:image)["']""", tag, flags=re.IGNORECASE)
+            value_match = re.search(r"""content\s*=\s*["']([^"']+)["']""", tag, flags=re.IGNORECASE)
             if key_match and value_match:
                 candidate = html.unescape(value_match.group(1)).replace("&amp;", "&")
                 if candidate.startswith("https://"):
@@ -359,9 +359,9 @@ def make_search_terms(text):
     cleaned = re.sub(r"@\w+|#[\w.]+", " ", cleaned)
     # Remove common creator/engagement/CTA phrases that are not product details.
     noise = re.compile(
-        r"\b(link in bio|follow for more|follow me|comment below|save this|share this|"
+        r"\b(link in bio|follow for more|follow me|comment below|comment for the links|comment for links|for the links|save this|share this|"
         r"dm me|dm for link|want to buy this look|shop this look|how to style|"
-        r"viral|trending now|must have|must-have|check my bio|use code|limited offer|"
+        r"viral|trending now|must have|must-have|check my bio|use code|limited offer|got this|got thi|"
         r"tag someone|which one|rate this|part \d+)\b", re.I
     )
     cleaned = noise.sub(" ", cleaned)
@@ -390,9 +390,14 @@ def make_search_row(reel_id, terms):
 
 
 def make_product_row(reel_id, links, label):
+    """Store the detected product label with up to three real shopping URLs."""
     row = {"reel_id": str(reel_id)}
+    clean_label = make_search_terms(label) or str(label or "Product from Instagram").strip()
+    if clean_label.lower() in {"shopping link from message", "shopping link found", "link from reel caption metadata", "product from reel"}:
+        clean_label = "Product from Instagram"
+    clean_label = clean_label[:65] or "Product from Instagram"
     for index, link in enumerate(links[:3], start=1):
-        row[f"product_{index}_title"] = f"{label} {index}"[:80]
+        row[f"product_{index}_title"] = clean_label[:80]
         row[f"product_{index}_url"] = link
     return row
 
@@ -521,65 +526,79 @@ def verify_follow_and_unlock(sender_id):
 
 
 def build_comparison_url(data):
-    """Build the comparison page URL; search rows populate all supported stores."""
-    title = ""
-    stores = {}
-    domain_to_store = (
-        ("amazon", ("amazon.", "amzn.to")),
-        ("flipkart", ("flipkart.com", "fkrt.it")),
-        ("meesho", ("meesho.com",)),
-        ("myntra", ("myntra.com",)),
-        ("ajio", ("ajio.com",)),
-        ("google", ("google.com", "google.co.in")),
-        ("nykaa", ("nykaa.com",)),
-        ("snapdeal", ("snapdeal.com",)),
-    )
+    """Build the store-picker URL. Search links are always present; known direct links override them."""
     labels = []
-    urls = []
+    direct_urls = []
     for index in range(1, 4):
         label = str(data.get(f"product_{index}_title") or "").strip()
         url = str(data.get(f"product_{index}_url") or "").strip()
         if label:
             labels.append(label)
         if url.startswith(("https://", "http://")):
-            urls.append((label, url))
-    # Search rows are generated by this bot and should create searches for every store.
+            direct_urls.append((label, url))
+
+    # Bot-generated search rows carry the clean query in "Search Amazon: ...".
     search_label = next((x for x in labels if x.lower().startswith("search amazon:")), "")
     if search_label:
         title = re.sub(r"^Search Amazon:\s*", "", search_label, flags=re.I).strip()
-        q = quote_plus(title)
-        stores = {
+    else:
+        title = next((x for x in labels if x), "Product from Instagram")
+        title = re.sub(r"^(Link from Reel caption/metadata|Shopping link from message|Shopping link found)\s*\d*:?\s*", "", title, flags=re.I).strip()
+        title = make_search_terms(title) or title
+    title = (title or "Product from Instagram")[:100]
+    q = quote_plus(title)
+
+    stores = {
+        "amazon_url": f"https://www.amazon.in/s?k={q}",
+        "flipkart_url": f"https://www.flipkart.com/search?q={q}",
+        "meesho_url": f"https://www.meesho.com/search?q={q}",
+        "myntra_url": f"https://www.myntra.com/{q.replace('+', '-')}",
+        "ajio_url": f"https://www.ajio.com/search/?text={q}",
+        "nykaa_url": f"https://www.nykaa.com/search/result/?q={q}",
+        "snapdeal_url": f"https://www.snapdeal.com/search?keyword={q}",
+        "google_url": f"https://www.google.com/search?tbm=shop&q={q}",
+    }
+    domain_to_store = (
+        ("amazon_url", ("amazon.", "amzn.to")),
+        ("flipkart_url", ("flipkart.com", "fkrt.it")),
+        ("meesho_url", ("meesho.com",)),
+        ("myntra_url", ("myntra.com",)),
+        ("ajio_url", ("ajio.com",)),
+        ("nykaa_url", ("nykaa.com",)),
+        ("snapdeal_url", ("snapdeal.com",)),
+        ("google_url", ("google.com", "google.co.in")),
+    )
+    # Prefer actual product URLs when the Reel/message supplied one for that store.
+    for _label, url in direct_urls:
+        host = (urlparse(url).hostname or "").lower()
+        for store_key, domains in domain_to_store:
+            if any(domain in host for domain in domains):
+                stores[store_key] = url
+                break
+
+    base_url = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/") or request.url_root.rstrip("/")
+    from urllib.parse import urlencode
+    comparison_url = base_url + "/compare?" + urlencode({"title": title, **stores})
+    # Instagram button URLs have practical length limits. If long affiliate/direct URLs
+    # make the destination too long, keep the product query and use store search URLs.
+    if len(comparison_url) > 1800:
+        search_only = {
             "amazon_url": f"https://www.amazon.in/s?k={q}",
             "flipkart_url": f"https://www.flipkart.com/search?q={q}",
             "meesho_url": f"https://www.meesho.com/search?q={q}",
             "myntra_url": f"https://www.myntra.com/{q.replace('+', '-')}",
             "ajio_url": f"https://www.ajio.com/search/?text={q}",
-            "google_url": f"https://www.google.com/search?tbm=shop&q={q}",
             "nykaa_url": f"https://www.nykaa.com/search/result/?q={q}",
             "snapdeal_url": f"https://www.snapdeal.com/search?keyword={q}",
+            "google_url": f"https://www.google.com/search?tbm=shop&q={q}",
         }
-    else:
-        for label, url in urls:
-            if not title and label:
-                title = re.sub(r"^(Link from Reel caption/metadata|Shopping link from message|Shopping link found)\s*", "", label, flags=re.I).strip()
-            host = (urlparse(url).hostname or "").lower()
-            matched = False
-            for store, domains in domain_to_store:
-                if any(domain in host for domain in domains):
-                    stores.setdefault(store + "_url", url)
-                    matched = True
-                    break
-            if not matched:
-                stores.setdefault("extra_url", url)
-        if not title:
-            title = "Product from Instagram"
-    base_url = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/") or request.url_root.rstrip("/")
-    from urllib.parse import urlencode
-    return base_url + "/compare?" + urlencode({"title": title[:180], **stores})
+        comparison_url = base_url + "/compare?" + urlencode({"title": title, **search_only})
+    return comparison_url
 
 
 def send_product_buttons(recipient_id, data, skip_follow_check=False):
-    # Preserve existing follow-verification behavior.
+    """Send one Link-Plox-style DM card; its button opens the store picker website."""
+    # Preserve the existing follow-verification behavior.
     if not skip_follow_check and FOLLOW_CHECK_PAGE_TOKEN:
         status = get_follow_status(recipient_id)
         if status is not True:
@@ -593,44 +612,39 @@ def send_product_buttons(recipient_id, data, skip_follow_check=False):
                 )
             return
 
-    # Search results: short query + eight stores, split into safe-sized DM messages.
-    search_title = next(
-        (str(data.get(f"product_{i}_title") or "") for i in range(1, 4)
-         if str(data.get(f"product_{i}_title") or "").lower().startswith("search ")),
-        "",
-    )
-    if search_title and ":" in search_title:
-        terms = search_title.split(":", 1)[1].strip()[:60]
-        query = quote_plus(terms)
-        stores = [
-            ("Amazon", f"https://www.amazon.in/s?k={query}"),
-            ("Flipkart", f"https://www.flipkart.com/search?q={query}"),
-            ("Meesho", f"https://www.meesho.com/search?q={query}"),
-            ("Myntra", f"https://www.myntra.com/{query}"),
-            ("AJIO", f"https://www.ajio.com/search/?text={query}"),
-            ("Nykaa", f"https://www.nykaa.com/search/result/?q={query}"),
-            ("Snapdeal", f"https://www.snapdeal.com/search?keyword={query}"),
-            ("Google Shopping", f"https://www.google.com/search?tbm=shop&q={query}"),
-        ]
-        lines = [f"🛍️ Product search: {terms}", ""]
-        lines.extend(f"{i}. {name}: {url}" for i, (name, url) in enumerate(stores, 1))
-        lines.append("These open store search results; exact product/stock may vary.")
-        _send_text_in_chunks(recipient_id, "\n".join(lines), max_chars=850)
-        return
-
-    # Actual links from a message/reel caption: keep each link on its own line.
-    lines = ["🛍️ Product links", ""]
-    count = 0
+    comparison_url = build_comparison_url(data)
+    title = ""
     for index in range(1, 4):
-        title = str(data.get(f"product_{index}_title") or "").strip()
-        url = str(data.get(f"product_{index}_url") or "").strip()
-        if title and url.startswith(("https://", "http://")):
-            count += 1
-            lines.append(f"{count}. {title[:55]}: {url}")
-    if count:
-        _send_text_in_chunks(recipient_id, "\n".join(lines), max_chars=850)
-    else:
-        send_simple_message(recipient_id, "Is Reel ke product links abhi available nahi hain.")
+        candidate = str(data.get(f"product_{index}_title") or "").strip()
+        if candidate:
+            title = candidate
+            break
+    title = re.sub(r"^Search Amazon:\s*", "", title, flags=re.I).strip()
+    title = re.sub(r"^(Link from Reel caption/metadata|Shopping link from message|Shopping link found)\s*\d*:?\s*", "", title, flags=re.I).strip()
+    title = make_search_terms(title) or title or "Product from your Reel"
+
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {
+            "attachment": {
+                "type": "template",
+                "payload": {
+                    "template_type": "generic",
+                    "elements": [{
+                        "title": title[:80],
+                        "subtitle": "Choose a store to shop this product",
+                        "buttons": [{
+                            "type": "web_url",
+                            "url": comparison_url,
+                            "title": "Shop Now",
+                        }],
+                    }],
+                },
+            }
+        },
+    }
+    print("Sending product card; product title:", title[:80])
+    send_api_request(payload)
 
 
 def _send_text_in_chunks(recipient_id, text, max_chars=850):
@@ -681,4 +695,4 @@ def send_api_request(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-    
+                     
