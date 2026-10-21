@@ -75,17 +75,32 @@ def process_message_event(event):
         return
 
     for attachment in attachments:
-        if attachment.get("type") != "share":
-            continue
+        
+attachment_type = attachment.get("type")
+payload = attachment.get("payload") or {}
 
-        payload = attachment.get("payload") or {}
-        reel_url = payload.get("url")
+if attachment_type not in ("share", "ig_reel", "ig_post"):
+    continue
+
+reel_url = payload.get("url")
+reel_id = (
+    payload.get("reel_video_id")
+    or payload.get("ig_post_media_id")
+)
+
+if not reel_id and reel_url:
+    reel_id = extract_reel_id(reel_url)
+    
+            
+
+        
+    
 
         if not reel_url:
             print("Share attachment had no URL.")
             continue
 
-        reel_id = extract_reel_id(reel_url)
+        
         if not reel_id:
             send_simple_message(
                 sender_id,
@@ -93,7 +108,7 @@ def process_message_event(event):
             )
             continue
 
-        product_data = get_products_from_db(reel_id)
+        
 
         if product_data:
             send_product_buttons(sender_id, product_data)
