@@ -77,8 +77,6 @@ const configs = [
  {key:"flipkart",aliases:["flipkart_url","flipkart_link"],name:"Flipkart",letter:"F",color:"#2875e8",note:"Shop at Flipkart"},
  {key:"meesho",aliases:["meesho_url","meesho_link"],name:"Meesho",letter:"m",color:"#e93b88",note:"Shop at Meesho"},
  {key:"myntra",aliases:["myntra_url","myntra_link"],name:"Myntra",letter:"M",color:"#ff477e",note:"Shop at Myntra"},
- {key:"ajio",aliases:["ajio_url","ajio_link"],name:"AJIO",letter:"A",color:"#27364c",note:"Shop at AJIO"},
- {key:"google",aliases:["google_url","google_link","shopping_url"],name:"Google Shopping",letter:"G",color:"#4285f4",note:"Find matching product listings"}
 ];
 const valid = value => {try {const u=new URL(value);return u.protocol==="https:"||u.protocol==="http:"}catch{return false}};
 const list = configs.map(c=>({...c,url:get(c.key,...c.aliases)})).filter(c=>valid(c.url));
@@ -90,8 +88,6 @@ if(!list.length){
   {...configs[1],url:"https://www.flipkart.com/search?q="+q},
   {...configs[2],url:"https://www.meesho.com/search?q="+q},
   {...configs[3],url:"https://www.myntra.com/"+q.replace(/%20/g,"-")},
-  {...configs[4],url:"https://www.ajio.com/search/?text="+q},
-  {...configs[5],url:"https://www.google.com/search?tbm=shop&q="+q}
  ];
  fallback.forEach(c=>list.push(c));
 }

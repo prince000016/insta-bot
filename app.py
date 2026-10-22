@@ -1222,11 +1222,7 @@ def build_comparison_url(data):
             "flipkart_url": f"https://www.flipkart.com/search?q={q}",
             "meesho_url": f"https://www.meesho.com/search?q={q}",
             "myntra_url": f"https://www.myntra.com/{q.replace('+', '-')}",
-            "ajio_url": f"https://www.ajio.com/search/?text={q}",
-            "google_url": f"https://www.google.com/search?tbm=shop&q={q}",
-            "nykaa_url": f"https://www.nykaa.com/search/result/?q={q}",
-            "snapdeal_url": f"https://www.snapdeal.com/search?keyword={q}",
-        }
+                                                        }
     else:
         for label, url in urls:
             if not title and label:
