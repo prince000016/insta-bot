@@ -135,6 +135,159 @@ def webhook():
 
 
 
+
+def _find_direct_video_url(payload):
+    """Find a direct video URL only from explicit video-related payload fields."""
+    candidates = []
+
+    def walk(value, key_hint=""):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_name = str(key).lower()
+                if isinstance(child, str) and child.startswith(("https://", "http://")):
+                    if key_name in {"video_url", "video_uri", "video_src", "video"}:
+                        candidates.append(child)
+                elif isinstance(child, (dict, list, tuple)):
+                    walk(child, key_name)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                walk(child, key_hint)
+
+    walk(payload)
+    for candidate in candidates:
+        try:
+            host = (urlparse(candidate).hostname or "").lower()
+            if host.endswith((".cdninstagram.com", ".fbcdn.net", ".instagram.com")):
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def extract_video_frames(video_url, max_frames=5, max_bytes=25 * 1024 * 1024):
+    """Extract sampled frames from an explicit direct Meta-hosted video URL.
+
+    A normal Instagram permalink is never downloaded as a video. Requires
+    imageio-ffmpeg; gracefully returns no frames if unavailable.
+    """
+    if not video_url:
+        return []
+    try:
+        host = (urlparse(video_url).hostname or "").lower()
+        if not host.endswith((".cdninstagram.com", ".fbcdn.net", ".instagram.com")):
+            print("Video frame scan skipped: host not allowed.")
+            return []
+
+        with tempfile.TemporaryDirectory(prefix="product_frames_") as temp_dir:
+            video_path = os.path.join(temp_dir, "source_video.mp4")
+            response = requests.get(
+                video_url, stream=True, timeout=(8, 20),
+                headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True,
+            )
+            response.raise_for_status()
+            final_host = (urlparse(response.url).hostname or "").lower()
+            if not final_host.endswith((".cdninstagram.com", ".fbcdn.net", ".instagram.com")):
+                response.close()
+                print("Video frame scan blocked unexpected redirect host.")
+                return []
+            total = 0
+            with open(video_path, "wb") as output:
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        response.close()
+                        print("Video frame scan skipped: video exceeds size limit.")
+                        return []
+                    output.write(chunk)
+            response.close()
+            if total < 1024:
+                return []
+
+            try:
+                import imageio_ffmpeg
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            except ImportError:
+                print("Video frame scan unavailable: imageio-ffmpeg is not installed.")
+                return []
+
+            pattern = os.path.join(temp_dir, "frame_%02d.jpg")
+            result = subprocess.run(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-i", video_path,
+                    "-vf", "fps=1/3,scale=640:-1:force_original_aspect_ratio=decrease",
+                    "-frames:v", str(max_frames), "-q:v", "4", "-y", pattern,
+                ],
+                capture_output=True, timeout=35, check=False,
+            )
+            if result.returncode != 0:
+                print("Video frame extraction failed:", result.stderr.decode("utf-8", "ignore")[:250])
+                return []
+            frames = []
+            for name in sorted(os.listdir(temp_dir)):
+                if re.fullmatch(r"frame_\d+\.jpg", name):
+                    with open(os.path.join(temp_dir, name), "rb") as frame_file:
+                        frames.append(frame_file.read())
+            print("Video frames extracted:", len(frames))
+            return frames[:max_frames]
+    except Exception as exc:
+        print("Video frame scan failed:", type(exc).__name__, str(exc)[:250])
+        return []
+
+
+def identify_products_from_image_bytes(image_bytes, mime_type="image/jpeg", max_products=3):
+    """Run Gemini visual identification directly on sampled frame bytes."""
+    if not image_bytes or not GEMINI_API_KEY:
+        return []
+    try:
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        prompt = (
+            "Identify distinct physical products visible in this image using only visual evidence. "
+            "Do not use captions, hashtags, creator text, or outside post context. "
+            "Return only a JSON array of up to " + str(max_products) +
+            " concise product names. Include brand/model only if visually supported; otherwise use the visible product type."
+        )
+        body = {
+            "contents": [{"parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": encoded}},
+            ]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 180,
+                "responseMimeType": "application/json",
+            },
+        }
+        response = requests.post(
+            GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=25
+        )
+        print("Gemini frame API status:", response.status_code)
+        if response.status_code != 200:
+            print("Gemini frame API error:", response.text[:300])
+            return []
+        candidates = response.json().get("candidates") or []
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        raw = " ".join(part.get("text", "") for part in parts).strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        names = []
+        for item in parsed:
+            if not isinstance(item, str):
+                continue
+            name = re.sub(r"\s+", " ", item).strip(" \t\r\n-•")[:75]
+            if len(name) >= 3 and name.casefold() not in {n.casefold() for n in names}:
+                names.append(name)
+            if len(names) >= max_products:
+                break
+        return names
+    except Exception as exc:
+        print("Gemini frame analysis failed:", type(exc).__name__, str(exc)[:250])
+        return []
+
+
 def process_message_event(event):
     sender = event.get("sender") or {}
     sender_id = sender.get("id")
@@ -1100,4 +1253,4 @@ def send_api_request(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-        
+    
