@@ -719,17 +719,13 @@ def inspect_public_reel_page(reel_url):
         return "", [], None
 
 def find_image_urls(payload, limit=4):
-    """Collect accessible image/thumbnail URLs included in the webhook payload.
-
-    This intentionally does not treat a Reel permalink or an MP4 URL as an image.
-    Instagram often sends only a permalink; in that case public-page thumbnail
-    discovery remains the fallback and may fail if Instagram blocks anonymous access.
-    """
+    """Collect image URLs from explicit image fields or known Meta shared-media CDN URLs."""
     found = []
     image_keys = {
         "thumbnail_url", "image_url", "image", "media_url", "thumbnail",
         "display_url", "cover_url", "preview_url", "image_src"
     }
+
     def walk(value, key_hint=""):
         if len(found) >= limit:
             return
@@ -743,16 +739,23 @@ def find_image_urls(payload, limit=4):
                 walk(child, key_hint)
                 if len(found) >= limit:
                     return
-        elif isinstance(value, str) and value.startswith("https://"):
-            path = urlparse(value).path.lower()
+        elif isinstance(value, str) and value.startswith(("https://", "http://")):
+            parsed = urlparse(value)
+            host = (parsed.hostname or "").lower()
+            path = parsed.path.lower()
             image_extension = path.endswith((".jpg", ".jpeg", ".png", ".webp", ".avif"))
-            if key_hint in image_keys or image_extension:
+            shared_media_url = (
+                host == "lookaside.fbsbx.com"
+                and path.startswith("/ig_messaging_cdn/")
+            )
+            if key_hint in image_keys or image_extension or (
+                key_hint == "url" and shared_media_url
+            ):
                 if value not in found:
                     found.append(value)
 
     walk(payload)
     return found
-
 
 def find_image_url(payload):
     """Compatibility wrapper returning the first image URL, if any."""
