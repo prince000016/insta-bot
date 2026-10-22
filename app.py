@@ -623,9 +623,9 @@ def process_message_event(event):
         image_urls = find_image_urls(payload, limit=3)
         # The webhook often provides ig_post_media_id but no image URL.
         # Try the official Graph API before relying on anonymous HTML scraping.
-        if not image_urls and payload.get("ig_post_media_id"):
+        if not image_urls and media_id:
             graph_visual_url, graph_media_type = retrieve_instagram_media_visual(
-                payload.get("ig_post_media_id")
+                media_id
             )
             if graph_visual_url:
                 image_urls.append(graph_visual_url)
