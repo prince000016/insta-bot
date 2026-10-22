@@ -288,6 +288,61 @@ def identify_products_from_image_bytes(image_bytes, mime_type="image/jpeg", max_
         return []
 
 
+
+def retrieve_instagram_media_visual(media_id):
+    """Try official Instagram Graph API media fields for a shared media ID.
+
+    This succeeds only if the configured token has permission to read that media.
+    Never logs access tokens or full URLs.
+    """
+    if not media_id:
+        return None, None
+    tokens = []
+    for token in (PAGE_ACCESS_TOKEN, FOLLOW_CHECK_IG_TOKEN):
+        if token and token not in tokens:
+            tokens.append(token)
+    for token in tokens:
+        try:
+            response = requests.get(
+                f"https://graph.instagram.com/v26.0/{quote_plus(str(media_id), safe='')}",
+                params={
+                    "fields": "media_url,thumbnail_url,media_type,permalink",
+                    "access_token": token,
+                },
+                timeout=(5, 12),
+            )
+            print("Instagram media lookup:", {
+                "status": response.status_code,
+                "token_source": "page" if token == PAGE_ACCESS_TOKEN else "follow_check",
+            })
+            if response.status_code != 200:
+                # Log only safe error metadata, never tokenized request URL.
+                try:
+                    err = (response.json().get("error") or {})
+                    print("Instagram media lookup error:", {
+                        "type": err.get("type"),
+                        "code": err.get("code"),
+                        "subcode": err.get("error_subcode"),
+                        "message": str(err.get("message", ""))[:180],
+                    })
+                except Exception:
+                    pass
+                continue
+            data = response.json()
+            media_url = data.get("media_url") or data.get("thumbnail_url")
+            if media_url and isinstance(media_url, str) and media_url.startswith("https://"):
+                print("Instagram Graph API returned media visual:", {
+                    "media_type": data.get("media_type"),
+                    "has_media_url": bool(data.get("media_url")),
+                    "has_thumbnail_url": bool(data.get("thumbnail_url")),
+                })
+                return media_url, data.get("media_type")
+            print("Instagram Graph API media lookup succeeded but returned no visual URL.")
+        except Exception as exc:
+            print("Instagram media lookup failed:", type(exc).__name__, str(exc)[:180])
+    return None, None
+
+
 def process_message_event(event):
     sender = event.get("sender") or {}
     sender_id = sender.get("id")
@@ -436,6 +491,14 @@ def process_message_event(event):
         # Public-page lookup is used ONLY to obtain a thumbnail. Captions,
         # descriptions, embedded text, and retailer links are deliberately ignored.
         image_urls = find_image_urls(payload, limit=3)
+        # The webhook often provides ig_post_media_id but no image URL.
+        # Try the official Graph API before relying on anonymous HTML scraping.
+        if not image_urls and payload.get("ig_post_media_id"):
+            graph_visual_url, graph_media_type = retrieve_instagram_media_visual(
+                payload.get("ig_post_media_id")
+            )
+            if graph_visual_url:
+                image_urls.append(graph_visual_url)
         print("Instagram media payload shape:", {
             "attachment_type": attachment_type,
             "payload_keys": sorted(str(k) for k in payload.keys())[:30],
