@@ -634,6 +634,7 @@ def process_message_event(event):
             "payload_keys": sorted(str(k) for k in payload.keys())[:30],
             "image_urls_found_in_payload": len(image_urls),
             "has_post_url": bool(post_url),
+        "post_url_host": urlparse(post_url).hostname if post_url else None,
         })
         if post_url:
             public_thumbnail = discover_public_thumbnail(post_url)
