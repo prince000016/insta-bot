@@ -218,23 +218,38 @@ def process_message_event(event):
             send_product_buttons(sender_id, product_data)
             continue
 
-        # Visual analysis only works when the webhook provides an accessible image URL.
-        image_url = find_image_url(payload) or public_thumbnail
-        if not image_url and reel_url:
-            image_url = discover_public_thumbnail(reel_url)
+        # Visual analysis: inspect up to three distinct accessible thumbnails/images.
+        # A normal post can work when its webhook payload includes image URLs. For a
+        # shared Reel permalink alone, this is still thumbnail analysis, NOT full video
+        # frame scanning; Instagram does not reliably expose the actual video file here.
+        image_urls = find_image_urls(payload, limit=3)
+        if public_thumbnail and public_thumbnail not in image_urls:
+            image_urls.append(public_thumbnail)
+        if not image_urls and reel_url:
+            discovered = discover_public_thumbnail(reel_url)
+            if discovered:
+                image_urls.append(discovered)
+        image_urls = image_urls[:3]
 
         visual_products = []
         visual_terms = ""
-        if image_url and GEMINI_API_KEY:
-            visual_products = identify_products_from_image_url(image_url, max_products=3)
-            # Keep the older single-query analyzer as a fallback if the multi-item
-            # response is unavailable or the image shows only one uncertain item.
-            if not visual_products:
-                visual_terms = identify_product_from_image_url(image_url)
-        elif image_url and not GEMINI_API_KEY:
+        if image_urls and GEMINI_API_KEY:
+            for image_index, image_url in enumerate(image_urls, start=1):
+                print(f"Visual analysis image {image_index}/{len(image_urls)}")
+                image_products = identify_products_from_image_url(image_url, max_products=3)
+                for product_name in image_products:
+                    if product_name.lower() not in {x.lower() for x in visual_products}:
+                        visual_products.append(product_name)
+                    if len(visual_products) >= 3:
+                        break
+                if len(visual_products) >= 3:
+                    break
+                if not visual_terms:
+                    visual_terms = identify_product_from_image_url(image_url)
+        elif image_urls and not GEMINI_API_KEY:
             print("Image URL present but GEMINI_API_KEY is missing.")
         else:
-            print("MULTI_PRODUCT_BLOCKED: no accessible Reel thumbnail; caption-only fallback will be used.")
+            print("MULTI_PRODUCT_BLOCKED: no accessible Reel/post thumbnail; caption-only fallback will be used.")
 
         if visual_products:
             print("MULTI_PRODUCT_RESULT:", len(visual_products), visual_products)
@@ -369,20 +384,46 @@ def inspect_public_reel_page(reel_url):
         print("Public Reel detector stage failed:", str(exc))
         return "", [], None
 
-def find_image_url(payload):
-    """Find image URLs only when Instagram actually includes one in the webhook payload."""
-    keys = ("thumbnail_url", "image_url", "image", "media_url", "thumbnail")
-    for key in keys:
-        value = payload.get(key)
-        if isinstance(value, str) and value.startswith("https://"):
-            path = urlparse(value).path.lower()
-            if any(path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")) or key in ("thumbnail_url", "image_url", "image", "thumbnail"):
-                return value
+def find_image_urls(payload, limit=4):
+    """Collect accessible image/thumbnail URLs included in the webhook payload.
+
+    This intentionally does not treat a Reel permalink or an MP4 URL as an image.
+    Instagram often sends only a permalink; in that case public-page thumbnail
+    discovery remains the fallback and may fail if Instagram blocks anonymous access.
+    """
+    found = []
+    image_keys = {
+        "thumbnail_url", "image_url", "image", "media_url", "thumbnail",
+        "display_url", "cover_url", "preview_url", "image_src"
+    }
+    def walk(value, key_hint=""):
+        if len(found) >= limit:
+            return
         if isinstance(value, dict):
-            nested = value.get("url") or value.get("src")
-            if isinstance(nested, str) and nested.startswith("https://"):
-                return nested
-    return None
+            for key, child in value.items():
+                walk(child, str(key).lower())
+                if len(found) >= limit:
+                    return
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                walk(child, key_hint)
+                if len(found) >= limit:
+                    return
+        elif isinstance(value, str) and value.startswith("https://"):
+            path = urlparse(value).path.lower()
+            image_extension = path.endswith((".jpg", ".jpeg", ".png", ".webp", ".avif"))
+            if key_hint in image_keys or image_extension:
+                if value not in found:
+                    found.append(value)
+
+    walk(payload)
+    return found
+
+
+def find_image_url(payload):
+    """Compatibility wrapper returning the first image URL, if any."""
+    urls = find_image_urls(payload, limit=1)
+    return urls[0] if urls else None
 
 
 def identify_product_from_image_url(image_url):
@@ -471,7 +512,9 @@ def identify_products_from_image_url(image_url, max_products=3):
             "Identify each distinct physical product/item visibly shown in this image, not just the overall category. "
             "Return ONLY a JSON array of 1 to " + str(max_products) + " short product search names. "
             "Include brand/model only when readable or clearly recognizable; do not invent brands. "
-            "For a lineup/display containing several different bottles/items, return each distinct visible item separately. ""Do not return people, captions, hashtags, generic marketing phrases, or duplicate variants. "
+            "For a lineup/display containing several different bottles/items, return each distinct visible item separately. "
+            "Read visible product labels/logos when legible, but do not invent text or brands. "
+            "Do not return people, captions, hashtags, generic marketing phrases, or duplicate variants. "
             "If the image does not show a clearly identifiable product, return []. "
             'Example: ["Beardo Godfather perfume", "Beardo Daddy perfume", "Beardo Toxic perfume"]'
         )
