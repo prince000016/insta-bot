@@ -63,6 +63,36 @@ def compare_page():
     return send_file(landing_file)
 
 
+def _safe_event_shape(event):
+    """Log only structural webhook metadata; never log message text, tokens, or full URLs."""
+    message = event.get("message") or {}
+    attachments = message.get("attachments") or []
+    attachment_shapes = []
+    for attachment in attachments[:5]:
+        payload = attachment.get("payload") or {}
+        attachment_shapes.append({
+            "type": attachment.get("type"),
+            "payload_keys": sorted(str(k) for k in payload.keys())[:30],
+            "has_url": bool(payload.get("url") or payload.get("link")),
+            "has_image_url": bool(
+                payload.get("image_url") or payload.get("thumbnail_url")
+                or payload.get("image") or payload.get("media_url")
+            ),
+            "has_video_url": bool(
+                payload.get("video_url") or payload.get("video_uri")
+                or payload.get("video_src") or payload.get("video")
+            ),
+        })
+    return {
+        "event_keys": sorted(str(k) for k in event.keys())[:30],
+        "has_message": bool(event.get("message")),
+        "has_text": bool(message.get("text")),
+        "attachment_count": len(attachments),
+        "attachments": attachment_shapes,
+        "has_postback": bool(event.get("postback")),
+    }
+
+
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
@@ -75,166 +105,34 @@ def webhook():
 
     data = request.get_json(silent=True) or {}
     print("Webhook received; object:", data.get("object"))
-    print("Webhook entries received:", len(data.get("entry", [])))
+    entries = data.get("entry", [])
+    print("Webhook entries received:", len(entries))
 
-    try:
-        for entry in data.get("entry", []):
-            for event in entry.get("messaging", []):
+    processed_events = 0
+    for entry in entries:
+        for event in entry.get("messaging", []):
+            print("Webhook event shape:", json.dumps(_safe_event_shape(event), ensure_ascii=True))
+            try:
                 process_message_event(event)
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                if change.get("field") == "messages":
+            except Exception as exc:
+                print("Webhook event processing error:", type(exc).__name__, str(exc)[:250])
+            processed_events += 1
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            if change.get("field") == "messages":
+                print("Webhook change shape:", json.dumps(_safe_event_shape(value), ensure_ascii=True))
+                try:
                     process_message_event(value)
-    except Exception as exc:
-        print("Webhook processing error:", str(exc))
+                except Exception as exc:
+                    print("Webhook change processing error:", type(exc).__name__, str(exc)[:250])
+                processed_events += 1
 
+    if processed_events == 0:
+        print("Webhook contained no messaging events. Entry keys:", [
+            sorted(str(k) for k in entry.keys())[:20] for entry in entries[:5]
+        ])
     return "OK", 200
 
-
-
-def _find_direct_video_url(payload):
-    """Return a likely direct video URL from explicit video fields only."""
-    candidates = []
-    def walk(obj, parent_key=""):
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                key_l = str(key).lower()
-                if isinstance(value, str) and value.startswith("https://") and (
-                    key_l in {"video_url", "video_uri", "video_src", "video"}
-                    or (key_l == "url" and parent_key in {"video", "video_data"})
-                ):
-                    candidates.append(value)
-                elif isinstance(value, (dict, list)):
-                    walk(value, key_l)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item, parent_key)
-    walk(payload)
-    for url in candidates:
-        try:
-            host = (urlparse(url).hostname or "").lower()
-            # Restrict video downloads to common Instagram/Meta media hosts.
-            if host.endswith(".cdninstagram.com") or host.endswith(".fbcdn.net") or host.endswith(".instagram.com"):
-                return url
-        except Exception:
-            pass
-    return None
-
-
-def extract_video_frames(video_url, max_frames=5, max_bytes=25 * 1024 * 1024):
-    """Download a direct Meta-hosted video URL and extract a few JPEG frames.
-
-    Requires imageio-ffmpeg. Returns frame byte strings; does not download Instagram
-    pages or attempt to bypass login/private-content restrictions.
-    """
-    if not video_url:
-        return []
-    try:
-        host = (urlparse(video_url).hostname or "").lower()
-        if not (host.endswith(".cdninstagram.com") or host.endswith(".fbcdn.net") or host.endswith(".instagram.com")):
-            print("Video frame scan skipped: host is not an allowed Meta media host.")
-            return []
-        with tempfile.TemporaryDirectory(prefix="product_frames_") as temp_dir:
-            video_path = os.path.join(temp_dir, "source_video.mp4")
-            response = requests.get(
-                video_url, stream=True, timeout=(8, 20),
-                headers={"User-Agent": "Mozilla/5.0"},
-                allow_redirects=True,
-            )
-            response.raise_for_status()
-            final_host = (urlparse(response.url).hostname or "").lower()
-            if not (final_host.endswith(".cdninstagram.com") or final_host.endswith(".fbcdn.net") or final_host.endswith(".instagram.com")):
-                print("Video frame scan blocked an unexpected redirect host.")
-                return []
-            total = 0
-            with open(video_path, "wb") as out:
-                for chunk in response.iter_content(chunk_size=64 * 1024):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > max_bytes:
-                        print("Video frame scan skipped: video exceeds size limit.")
-                        return []
-                    out.write(chunk)
-            response.close()
-            if total < 1024:
-                return []
-
-            try:
-                import imageio_ffmpeg
-                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-            except ImportError:
-                print("Video frame scan unavailable: imageio-ffmpeg dependency is missing.")
-                return []
-
-            # Sample at most one frame every 3 seconds, capped at max_frames.
-            pattern = os.path.join(temp_dir, "frame_%02d.jpg")
-            command = [
-                ffmpeg, "-hide_banner", "-loglevel", "error", "-i", video_path,
-                "-vf", "fps=1/3,scale=640:-1:force_original_aspect_ratio=decrease",
-                "-frames:v", str(max_frames), "-q:v", "4", "-y", pattern,
-            ]
-            result = subprocess.run(command, capture_output=True, timeout=35, check=False)
-            if result.returncode != 0:
-                print("Video frame extraction failed:", result.stderr.decode("utf-8", "ignore")[:300])
-                return []
-            frames = []
-            for name in sorted(os.listdir(temp_dir)):
-                if re.fullmatch(r"frame_\d+\.jpg", name):
-                    with open(os.path.join(temp_dir, name), "rb") as frame:
-                        frames.append(frame.read())
-            print("Video frames extracted:", len(frames))
-            return frames[:max_frames]
-    except Exception as exc:
-        print("Video frame scan failed:", type(exc).__name__, str(exc)[:250])
-        return []
-
-
-def identify_products_from_image_bytes(image_bytes, mime_type="image/jpeg", max_products=3):
-    """Ask Gemini to identify products from actual image bytes, not post captions."""
-    if not GEMINI_API_KEY or not image_bytes:
-        return []
-    try:
-        encoded = base64.b64encode(image_bytes).decode("ascii")
-        prompt = (
-            "Identify each distinct physical product visibly shown in this image. "
-            "Use ONLY visual evidence: visible logos, readable labels, product shape and design. "
-            "Do not use captions, hashtags, creator text, or outside post context. "
-            "Return ONLY a JSON array of up to " + str(max_products) +
-            " concise product search names. Include brand/model only if visually supported. "
-            "If no product is confidently identifiable, return []."
-        )
-        body = {
-            "contents": [{"parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime_type, "data": encoded}},
-            ]}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 180, "responseMimeType": "application/json"},
-        }
-        response = requests.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=25)
-        print("Gemini frame API status:", response.status_code)
-        if response.status_code != 200:
-            print("Gemini frame API error:", response.text[:500])
-            return []
-        candidates = response.json().get("candidates") or []
-        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-        raw = " ".join(part.get("text", "") for part in parts).strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
-        parsed = json.loads(raw)
-        if not isinstance(parsed, list):
-            return []
-        names = []
-        for item in parsed:
-            if isinstance(item, str):
-                name = re.sub(r"\s+", " ", item).strip(" \t\r\n-•")
-                if len(name) >= 3 and name.casefold() not in {n.casefold() for n in names}:
-                    names.append(name[:75])
-            if len(names) >= max_products:
-                break
-        return names
-    except Exception as exc:
-        print("Gemini frame analysis failed:", type(exc).__name__, str(exc)[:250])
-        return []
 
 
 def process_message_event(event):
@@ -385,11 +283,19 @@ def process_message_event(event):
         # Public-page lookup is used ONLY to obtain a thumbnail. Captions,
         # descriptions, embedded text, and retailer links are deliberately ignored.
         image_urls = find_image_urls(payload, limit=3)
+        print("Instagram media payload shape:", {
+            "attachment_type": attachment_type,
+            "payload_keys": sorted(str(k) for k in payload.keys())[:30],
+            "image_urls_found_in_payload": len(image_urls),
+            "has_post_url": bool(post_url),
+        })
         if post_url:
             public_thumbnail = discover_public_thumbnail(post_url)
+            print("Public thumbnail retrieval result:", bool(public_thumbnail))
             if public_thumbnail and public_thumbnail not in image_urls:
                 image_urls.append(public_thumbnail)
         image_urls = image_urls[:3]
+        print("Total accessible image URLs:", len(image_urls))
 
         # If the webhook explicitly includes a direct video URL, scan sampled frames
         # first. A normal Instagram permalink is NOT treated as a video file.
@@ -474,50 +380,80 @@ def extract_reel_id(url):
 
 
 def discover_public_thumbnail(reel_url):
-    """Best-effort public Reel thumbnail lookup; Instagram may block unauthenticated access."""
+    """Best-effort thumbnail extraction from public Instagram HTML metadata."""
     if not reel_url or not re.match(r"^https://(?:www\.)?instagram\.com/(?:reel|reels|p)/", reel_url):
         return None
     try:
         response = requests.get(
-            reel_url, timeout=12,
+            reel_url, timeout=(6, 15),
             headers={
                 "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
             },
             allow_redirects=True,
         )
-        print("Public Reel page status:", response.status_code)
-        if response.status_code != 200:
-            print("Public Reel thumbnail unavailable: Instagram returned non-200.")
+        final_host = (urlparse(response.url).hostname or "").lower()
+        content_type = response.headers.get("content-type", "").split(";")[0].lower()
+        print("Public media page response:", {
+            "status": response.status_code,
+            "final_host": final_host,
+            "content_type": content_type,
+            "bytes": len(response.content or b""),
+        })
+        if response.status_code != 200 or "html" not in content_type:
+            print("Thumbnail unavailable: response is not successful HTML.")
             return None
-        page = response.text[:3_000_000]
-        # First pass: Open Graph / Twitter meta tags (attribute order may vary).
-        for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.I):
-            property_match = re.search(r"""(?:property|name)\s*=\s*["'](?:og:image|twitter:image)["']""", tag, flags=re.I)
-            content_match = re.search(r"""content\s*=\s*["']([^"']+)["']""", tag, flags=re.I)
-            if property_match and content_match:
-                candidate = html.unescape(content_match.group(1)).replace("&amp;", "&")
-                if candidate.startswith("https://"):
-                    print("Public Reel thumbnail metadata found.")
-                    return candidate
-        # Second pass: JSON-embedded thumbnail_url / display_url values.
-        patterns = [
-            r'"thumbnail_url"\s*:\s*"([^"]+)"',
-            r'"display_url"\s*:\s*"([^"]+)"',
-            r'"og:image"\s*content="([^"]+)"',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, page)
-            if match:
-                candidate = html.unescape(match.group(1)).replace(r"\u0026", "&").replace(r"\/", "/")
-                if candidate.startswith("https://"):
-                    print("Public Reel thumbnail found in embedded page data.")
-                    return candidate
-        print("No accessible public Reel thumbnail found.")
+
+        page = response.text[:4_000_000]
+        tags = re.findall(r"<meta\b[^>]*>", page, flags=re.I)
+        candidates = []
+
+        # Parse each meta tag independent of attribute order or quote style.
+        for tag in tags:
+            attrs = {}
+            for match in re.finditer(
+                r"""([a-zA-Z_:][-a-zA-Z0-9_:]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+                tag,
+            ):
+                attrs[match.group(1).lower()] = next(
+                    group for group in match.groups()[1:] if group is not None
+                )
+            key = (attrs.get("property") or attrs.get("name") or "").lower()
+            value = attrs.get("content") or ""
+            if key in {"og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"}:
+                candidates.append(value)
+
+        # Instagram sometimes embeds image URLs in JSON rather than OG tags.
+        for pattern in (
+            r'"(?:thumbnail_url|display_url|image_url)"\s*:\s*"((?:https?:\\?/\\?/)[^"]+)"',
+            r'"og:image"\s*:\s*"([^"]+)"',
+        ):
+            candidates.extend(match.group(1) for match in re.finditer(pattern, page, flags=re.I))
+
+        for candidate in candidates:
+            candidate = html.unescape(candidate)
+            candidate = candidate.replace(r"\u0026", "&").replace(r"\/", "/").replace("&amp;", "&")
+            candidate = candidate.replace(r"\u003D", "=").replace(r"\u003d", "=")
+            if candidate.startswith("//"):
+                candidate = "https:" + candidate
+            if candidate.startswith("https://") and not candidate.startswith("https://www.instagram.com/"):
+                print("Public thumbnail metadata found.")
+                return candidate
+
+        # Diagnostic only: distinguish a login/challenge shell from a page with no OG image.
+        lower_page = page.lower()
+        if "login" in lower_page and ("accounts/login" in lower_page or "loginrequired" in lower_page):
+            print("Instagram returned a login-required page; public thumbnail is not accessible.")
+        elif "challenge" in lower_page or "consent" in lower_page:
+            print("Instagram returned a challenge/consent page; public thumbnail is not accessible.")
+        else:
+            print("Instagram HTML had no recognized public image metadata; meta tags:", len(tags))
     except Exception as exc:
-        print("Public thumbnail lookup failed:", str(exc))
+        print("Public thumbnail lookup failed:", type(exc).__name__, str(exc)[:250])
     return None
+
 
 
 def inspect_public_reel_page(reel_url):
@@ -921,7 +857,7 @@ def send_follow_gate(recipient_id):
             "attachment": {
                 "type": "template",
                 "payload": {
-                    "template_type": "generic",   
+                    "template_type": "generic",
                     "elements": [{
                         "title": "Follow to unlock product links",
                         "subtitle": "Follow @find_myproduct52, then tap Verify Follow.",
@@ -1164,6 +1100,4 @@ def send_api_request(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-    
-                    
-      
+        
