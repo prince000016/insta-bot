@@ -868,30 +868,13 @@ def identify_products_from_image_url(image_url, max_products=3):
                 "responseMimeType": "application/json"
             }
         }
-        import time
-        response = None
-        for attempt in range(3):
-            try:
-                response = requests.post(
-                    GEMINI_URL, params={"key": GEMINI_API_KEY},
-                    json=body, timeout=40
-                )
-                print("Gemini multi-product API status:", response.status_code)
-                if response.status_code == 200:
-                    break
-                if response.status_code not in (408, 429, 500, 502, 503, 504):
-                    print("Gemini multi-product API error:", response.text[:800])
-                    return []
-                print(f"Temporary Gemini error; retry {attempt + 1}/3")
-            except requests.RequestException as exc:
-                print(f"Gemini request failed; retry {attempt + 1}/3: {exc}")
-                if attempt == 2:
-                    return []
-            if attempt < 2:
-                time.sleep(2 ** (attempt + 1))
-        if response is None or response.status_code != 200:
-            if response is not None:
-                print("Gemini multi-product API error:", response.text[:800])
+        response = requests.post(
+            GEMINI_URL, params={"key": GEMINI_API_KEY},
+            json=body, timeout=25
+        )
+        print("Gemini multi-product API status:", response.status_code)
+        if response.status_code != 200:
+            print("Gemini multi-product API error:", response.text[:800])
             return []
         result = response.json()
         candidates = result.get("candidates") or []
