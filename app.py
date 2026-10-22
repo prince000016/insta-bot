@@ -337,9 +337,18 @@ def _call_vision_model(image_bytes, mime_type, prompt, max_tokens=180, json_mode
                 # Do not log request headers or API key.
                 print("Z.ai vision API error:", response.text[:500])
                 return ""
-            choices = response.json().get("choices") or []
+            response_data = response.json()
+            choices = response_data.get("choices") or []
             message = choices[0].get("message", {}) if choices else {}
             content = message.get("content", "")
+            print("OpenRouter diagnostic:", {
+                "model": response_data.get("model"),
+                "choices_count": len(choices),
+                "finish_reason": choices[0].get("finish_reason") if choices else None,
+                "content_type": type(content).__name__,
+                "content_length": len(content) if isinstance(content, str) else None,
+                "has_error": bool(response_data.get("error")),
+            })
             if isinstance(content, list):
                 content = " ".join(
                     str(item.get("text", "")) for item in content
