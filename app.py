@@ -36,6 +36,14 @@ GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-3.8-flash:generateContent"
 )
+# Z.ai vision API is preferred when configured. Gemini remains a compatibility
+# fallback for deployments that have not configured ZAI_API_KEY.
+ZAI_API_KEY = os.environ.get("ZAI_API_KEY", "").strip()
+ZAI_URL = os.environ.get(
+    "ZAI_API_URL", "https://api.z.ai/api/paas/v4/chat/completions"
+).strip()
+ZAI_MODEL = os.environ.get("ZAI_MODEL", "glm-5.3-flash").strip()
+HAS_VISION_API_KEY = bool(ZAI_API_KEY or GEMINI_API_KEY)
 
 SHOPPING_DOMAINS = (
     "amazon.", "amzn.to", "flipkart.com", "fkrt.it", "meesho.com",
@@ -236,40 +244,112 @@ def extract_video_frames(video_url, max_frames=5, max_bytes=25 * 1024 * 1024):
         return []
 
 
+def _call_vision_model(image_bytes, mime_type, prompt, max_tokens=180, json_mode=False):
+    """Call Z.ai vision first when configured; otherwise retain Gemini compatibility.
+
+    A configured but failing Z.ai key does not trigger a second paid-provider call.
+    """
+    if not image_bytes:
+        return ""
+
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+
+    if ZAI_API_KEY:
+        body = {
+            "model": ZAI_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{encoded}"
+                        },
+                    },
+                ],
+            }],
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+        }
+        try:
+            response = requests.post(
+                ZAI_URL,
+                headers={
+                    "Authorization": f"Bearer {ZAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=35,
+            )
+            print("Z.ai vision API status:", response.status_code)
+            if response.status_code != 200:
+                # Do not log request headers or API key.
+                print("Z.ai vision API error:", response.text[:500])
+                return ""
+            choices = response.json().get("choices") or []
+            message = choices[0].get("message", {}) if choices else {}
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(item.get("text", "")) for item in content
+                    if isinstance(item, dict)
+                )
+            return str(content or "").strip()
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            print("Z.ai vision request failed:", type(exc).__name__, str(exc)[:200])
+            return ""
+
+    if not HAS_VISION_API_KEY:
+        return ""
+
+    parts = [
+        {"text": prompt},
+        {"inline_data": {"mime_type": mime_type, "data": encoded}},
+    ]
+    generation_config = {
+        "temperature": 0.1,
+        "maxOutputTokens": max_tokens,
+    }
+    if json_mode:
+        generation_config["responseMimeType"] = "application/json"
+    body = {"contents": [{"parts": parts}], "generationConfig": generation_config}
+    try:
+        response = requests.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json=body,
+            timeout=25,
+        )
+        print("Gemini vision API status:", response.status_code)
+        if response.status_code != 200:
+            print("Gemini vision API error:", response.text[:500])
+            return ""
+        candidates = response.json().get("candidates") or []
+        content_parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        return " ".join(str(part.get("text", "")) for part in content_parts).strip()
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        print("Gemini vision request failed:", type(exc).__name__, str(exc)[:200])
+        return ""
+
+
 def identify_products_from_image_bytes(image_bytes, mime_type="image/jpeg", max_products=3):
-    """Run Gemini visual identification directly on sampled frame bytes."""
-    if not image_bytes or not GEMINI_API_KEY:
+    """Identify visible products from sampled video-frame bytes using configured vision API."""
+    if not image_bytes or not HAS_VISION_API_KEY:
+        return []
+    prompt = (
+        "Identify distinct physical products visible in this image using only visual evidence. "
+        "Do not use captions, hashtags, creator text, or outside post context. "
+        "Return only a JSON array of up to " + str(max_products) +
+        " concise product names. Include brand/model only if visually supported; otherwise use the visible product type."
+    )
+    raw = _call_vision_model(
+        image_bytes, mime_type, prompt, max_tokens=180, json_mode=True
+    )
+    if not raw:
         return []
     try:
-        encoded = base64.b64encode(image_bytes).decode("ascii")
-        prompt = (
-            "Identify distinct physical products visible in this image using only visual evidence. "
-            "Do not use captions, hashtags, creator text, or outside post context. "
-            "Return only a JSON array of up to " + str(max_products) +
-            " concise product names. Include brand/model only if visually supported; otherwise use the visible product type."
-        )
-        body = {
-            "contents": [{"parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime_type, "data": encoded}},
-            ]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 180,
-                "responseMimeType": "application/json",
-            },
-        }
-        response = requests.post(
-            GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=25
-        )
-        print("Gemini frame API status:", response.status_code)
-        if response.status_code != 200:
-            print("Gemini frame API error:", response.text[:300])
-            return []
-        candidates = response.json().get("candidates") or []
-        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-        raw = " ".join(part.get("text", "") for part in parts).strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
         parsed = json.loads(raw)
         if not isinstance(parsed, list):
             return []
@@ -283,8 +363,8 @@ def identify_products_from_image_bytes(image_bytes, mime_type="image/jpeg", max_
             if len(names) >= max_products:
                 break
         return names
-    except Exception as exc:
-        print("Gemini frame analysis failed:", type(exc).__name__, str(exc)[:250])
+    except (ValueError, TypeError) as exc:
+        print("Vision frame JSON parsing failed:", type(exc).__name__, str(exc)[:180])
         return []
 
 
@@ -405,9 +485,9 @@ def process_message_event(event):
                     "Image mili, lekin accessible image URL nahi mila. Product ka clear screenshot/photo dobara DM karo.",
                 )
                 continue
-            if not GEMINI_API_KEY:
-                print("Image attachment received but GEMINI_API_KEY is missing.")
-                send_simple_message(sender_id, "Visual detection ke liye GEMINI_API_KEY configured nahi hai.")
+            if not HAS_VISION_API_KEY:
+                print("Image attachment received but ZAI_API_KEY/GEMINI_API_KEY is missing.")
+                send_simple_message(sender_id, "Visual detection ke liye ZAI_API_KEY ya GEMINI_API_KEY configured nahi hai.")
                 continue
 
             visual_products = []
@@ -420,15 +500,6 @@ def process_message_event(event):
                         break
                 if len(visual_products) >= 3:
                     break
-
-            if not visual_products:
-                # Image-only fallback. This still sends the image to Gemini; it
-                # never substitutes caption, title, or message text as the name.
-                for image_url in image_urls:
-                    name = identify_product_from_image_url(image_url)
-                    if name and name.casefold() not in {"unknown", "none", "not identifiable"}:
-                        visual_products.append(name)
-                        break
 
             if visual_products:
                 print("VISUAL_ONLY_DM_PRODUCTS:", visual_products)
@@ -517,7 +588,7 @@ def process_message_event(event):
         # first. A normal Instagram permalink is NOT treated as a video file.
         video_url = _find_direct_video_url(payload)
         frame_products = []
-        if video_url and GEMINI_API_KEY:
+        if video_url and HAS_VISION_API_KEY:
             for frame_bytes in extract_video_frames(video_url, max_frames=5):
                 for name in identify_products_from_image_bytes(frame_bytes, max_products=3):
                     if name and name.casefold() not in {x.casefold() for x in frame_products}:
@@ -544,9 +615,9 @@ def process_message_event(event):
             )
             continue
 
-        if not GEMINI_API_KEY:
-            print("Visuals available but GEMINI_API_KEY is missing.")
-            send_simple_message(sender_id, "Visual product detection ke liye GEMINI_API_KEY configured nahi hai.")
+        if not HAS_VISION_API_KEY:
+            print("Visuals available but ZAI_API_KEY/GEMINI_API_KEY is missing.")
+            send_simple_message(sender_id, "Visual product detection ke liye ZAI_API_KEY ya GEMINI_API_KEY configured nahi hai.")
             continue
 
         visual_products = []
@@ -560,13 +631,6 @@ def process_message_event(event):
                     break
             if len(visual_products) >= 3:
                 break
-
-        if not visual_products:
-            for image_url in image_urls:
-                name = identify_product_from_image_url(image_url)
-                if name and name.casefold() not in {"unknown", "none", "not identifiable"}:
-                    visual_products.append(name)
-                    break
 
         if visual_products:
             print("VISUAL_ONLY_PRODUCTS:", len(visual_products), visual_products)
@@ -764,14 +828,12 @@ def find_image_url(payload):
 
 
 def identify_product_from_image_url(image_url):
-    """Download a publicly accessible image and ask Gemini for a concise product query."""
-    if not GEMINI_API_KEY:
+    """Download a public image and identify one product using the configured vision API."""
+    if not HAS_VISION_API_KEY:
         return ""
     try:
         image_response = requests.get(
-            image_url,
-            timeout=12,
-            headers={"User-Agent": "Mozilla/5.0"}
+            image_url, timeout=12, headers={"User-Agent": "Mozilla/5.0"}
         )
         image_response.raise_for_status()
         content_type = image_response.headers.get("Content-Type", "").split(";")[0].lower()
@@ -781,71 +843,44 @@ def identify_product_from_image_url(image_url):
         if len(image_response.content) > 8 * 1024 * 1024:
             print("Visual analysis skipped: image is larger than 8 MB.")
             return ""
-
-        mime_type = content_type if content_type in ("image/jpeg", "image/png", "image/webp", "image/heic", "image/heif") else "image/jpeg"
-        encoded = base64.b64encode(image_response.content).decode("ascii")
-        body = {
-            "contents": [{
-                "parts": [
-                    {"text": (
-                        "Identify the physical product shown in this image using visual evidence only. "
-                        "Do not use or assume any caption, hashtags, creator text, or post context. "
-                        "Return visible brand/model and product type only when supported by the image; "
-                        "otherwise return UNKNOWN. Return one concise product name/search query only."
-                    )},
-                    {"inline_data": {"mime_type": mime_type, "data": encoded}}
-                ]
-            }],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 80}
-        }
-        response = requests.post(
-            GEMINI_URL,
-            params={"key": GEMINI_API_KEY},
-            json=body,
-            timeout=25
+        mime_type = content_type if content_type in (
+            "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"
+        ) else "image/jpeg"
+        prompt = (
+            "Identify the physical product shown in this image using visual evidence only. "
+            "Do not use or assume any caption, hashtags, creator text, or post context. "
+            "Return visible brand/model and product type only when supported by the image; "
+            "otherwise return UNKNOWN. Return one concise product name/search query only."
         )
-        print("Gemini API status:", response.status_code)
-        if response.status_code != 200:
-            print("Gemini API error:", response.text[:800])
-            return ""
-        result = response.json()
-        candidates = result.get("candidates") or []
-        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-        text_value = " ".join(p.get("text", "") for p in parts).strip()
-        text_value = re.sub(r"\s+", " ", text_value)
+        text_value = _call_vision_model(
+            image_response.content, mime_type, prompt, max_tokens=80
+        )
+        text_value = re.sub(r"\s+", " ", text_value).strip()
         if text_value and text_value.lower() not in ("unknown", "none", "not identifiable"):
-            print("Gemini visual product query:", text_value[:200])
+            print("Vision product query:", text_value[:180])
             return text_value[:180]
-    except Exception as exc:
-        print("Gemini visual analysis failed:", str(exc))
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        print("Visual image analysis failed:", type(exc).__name__, str(exc)[:200])
     return ""
 
 
 
 def identify_products_from_image_url(image_url, max_products=3):
-    """Identify distinct visible products from a Reel thumbnail using Gemini.
-
-    Returns a list of concise product search names. A thumbnail is not a full
-    video, so this intentionally reports only products visibly supported by it.
-    """
-    if not GEMINI_API_KEY or not image_url:
+    """Identify distinct visible products from an image using the configured vision API."""
+    if not HAS_VISION_API_KEY or not image_url:
         return []
     try:
         image_response = requests.get(
-            image_url,
-            timeout=12,
-            headers={"User-Agent": "Mozilla/5.0"}
+            image_url, timeout=12, headers={"User-Agent": "Mozilla/5.0"}
         )
         image_response.raise_for_status()
         content_type = image_response.headers.get("Content-Type", "").split(";")[0].lower()
         if not content_type.startswith("image/") or len(image_response.content) > 8 * 1024 * 1024:
             print("Multi-product analysis skipped: URL is not a supported image or exceeds 8 MB.")
             return []
-
         mime_type = content_type if content_type in (
             "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"
         ) else "image/jpeg"
-        encoded = base64.b64encode(image_response.content).decode("ascii")
         prompt = (
             "Identify each distinct physical product/item visibly shown in this image, not just the overall category. "
             "Use only pixels, visible logos, and readable labels in this image; do not use caption, hashtags, creator text, or post context. "
@@ -857,30 +892,12 @@ def identify_products_from_image_url(image_url, max_products=3):
             "If the image does not show a clearly identifiable product, return []. "
             'Example: ["Beardo Godfather perfume", "Beardo Daddy perfume", "Beardo Toxic perfume"]'
         )
-        body = {
-            "contents": [{"parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime_type, "data": encoded}}
-            ]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 180,
-                "responseMimeType": "application/json"
-            }
-        }
-        response = requests.post(
-            GEMINI_URL, params={"key": GEMINI_API_KEY},
-            json=body, timeout=25
+        raw = _call_vision_model(
+            image_response.content, mime_type, prompt, max_tokens=180, json_mode=True
         )
-        print("Gemini multi-product API status:", response.status_code)
-        if response.status_code != 200:
-            print("Gemini multi-product API error:", response.text[:800])
+        if not raw:
             return []
-        result = response.json()
-        candidates = result.get("candidates") or []
-        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-        raw = " ".join(part.get("text", "") for part in parts).strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
         parsed = json.loads(raw)
         if not isinstance(parsed, list):
             return []
@@ -888,20 +905,21 @@ def identify_products_from_image_url(image_url, max_products=3):
         for item in parsed:
             if not isinstance(item, str):
                 continue
-                name = re.sub(r"\s+", " ", item).strip(" \t\r\n-•")
+            name = re.sub(r"\s+", " ", item).strip(" \t\r\n-•")
             if len(name) < 3:
                 continue
-            if name.lower() not in {x.lower() for x in cleaned}:
+            if name.casefold() not in {x.casefold() for x in cleaned}:
                 cleaned.append(name[:75])
             if len(cleaned) >= max_products:
                 break
-        print("Gemini identified product count:", len(cleaned))
+        print("Vision identified product count:", len(cleaned))
         if cleaned:
-            print("Gemini identified product names:", " | ".join(cleaned))
+            print("Vision identified product names:", " | ".join(cleaned))
         return cleaned
     except (requests.RequestException, ValueError, TypeError) as exc:
-        print("Gemini multi-product analysis failed:", str(exc))
+        print("Multi-product vision analysis failed:", type(exc).__name__, str(exc)[:200])
         return []
+
 
 
 def build_single_product_compare_url(title):
