@@ -36,14 +36,18 @@ GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-3.8-flash:generateContent"
 )
-# Z.ai vision API is preferred when configured. Gemini remains a compatibility
-# fallback for deployments that have not configured ZAI_API_KEY.
+# OpenRouter's free-model router is primary. Z.ai and Gemini remain fallbacks.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_URL = os.environ.get(
+    "OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions"
+).strip()
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free").strip()
 ZAI_API_KEY = os.environ.get("ZAI_API_KEY", "").strip()
 ZAI_URL = os.environ.get(
     "ZAI_API_URL", "https://api.z.ai/api/paas/v4/chat/completions"
 ).strip()
 ZAI_MODEL = os.environ.get("ZAI_MODEL", "glm-5.3-flash").strip()
-HAS_VISION_API_KEY = bool(ZAI_API_KEY or GEMINI_API_KEY)
+HAS_VISION_API_KEY = bool(OPENROUTER_API_KEY or ZAI_API_KEY or GEMINI_API_KEY)
 
 SHOPPING_DOMAINS = (
     "amazon.", "amzn.to", "flipkart.com", "fkrt.it", "meesho.com",
@@ -245,15 +249,61 @@ def extract_video_frames(video_url, max_frames=5, max_bytes=25 * 1024 * 1024):
 
 
 def _call_vision_model(image_bytes, mime_type, prompt, max_tokens=180, json_mode=False):
-    """Call Z.ai vision first when configured; otherwise retain Gemini compatibility.
-
-    A configured but failing Z.ai key does not trigger a second paid-provider call.
-    """
+    """Use OpenRouter's free router first, then Z.ai, then Gemini as fallbacks."""
     if not image_bytes:
         return ""
 
     encoded = base64.b64encode(image_bytes).decode("ascii")
 
+    # Primary provider: OpenRouter free router. It only routes among free variants.
+    if OPENROUTER_API_KEY:
+        body = {
+            "model": OPENROUTER_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:{mime_type};base64,{encoded}"
+                    }},
+                ],
+            }],
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+        }
+        try:
+            response = requests.post(
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL", "https://insta-bot-9b3x.onrender.com"),
+                    "X-Title": os.environ.get("OPENROUTER_APP_NAME", "Instagram Product Finder"),
+                },
+                json=body,
+                timeout=35,
+            )
+            print("OpenRouter vision API status:", response.status_code)
+            if response.status_code == 200:
+                choices = response.json().get("choices") or []
+                message = choices[0].get("message", {}) if choices else {}
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        str(item.get("text", "")) for item in content
+                        if isinstance(item, dict)
+                    )
+                content = str(content or "").strip()
+                if content:
+                    return content
+                print("OpenRouter returned empty content; trying configured fallback.")
+            else:
+                # Log only a short response body; never log authorization headers.
+                print("OpenRouter vision API error:", response.text[:400])
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            print("OpenRouter vision request failed:", type(exc).__name__, str(exc)[:200])
+
+    # Fallback provider 1: Z.ai.
     if ZAI_API_KEY:
         body = {
             "model": ZAI_MODEL,
@@ -486,8 +536,8 @@ def process_message_event(event):
                 )
                 continue
             if not HAS_VISION_API_KEY:
-                print("Image attachment received but ZAI_API_KEY/GEMINI_API_KEY is missing.")
-                send_simple_message(sender_id, "Visual detection ke liye ZAI_API_KEY ya GEMINI_API_KEY configured nahi hai.")
+                print("Image attachment received but OPENROUTER_API_KEY/ZAI_API_KEY/GEMINI_API_KEY is missing.")
+                send_simple_message(sender_id, "Visual detection ke liye OPENROUTER_API_KEY, ZAI_API_KEY ya GEMINI_API_KEY configured nahi hai.")
                 continue
 
             visual_products = []
@@ -616,8 +666,8 @@ def process_message_event(event):
             continue
 
         if not HAS_VISION_API_KEY:
-            print("Visuals available but ZAI_API_KEY/GEMINI_API_KEY is missing.")
-            send_simple_message(sender_id, "Visual product detection ke liye ZAI_API_KEY ya GEMINI_API_KEY configured nahi hai.")
+            print("Visuals available but OPENROUTER_API_KEY/ZAI_API_KEY/GEMINI_API_KEY is missing.")
+            send_simple_message(sender_id, "Visual product detection ke liye OPENROUTER_API_KEY, ZAI_API_KEY ya GEMINI_API_KEY configured nahi hai.")
             continue
 
         visual_products = []
