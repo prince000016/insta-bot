@@ -3,6 +3,8 @@ import re
 import html
 import base64
 import json
+import subprocess
+import tempfile
 import requests
 from urllib.parse import quote_plus, urlparse
 from flask import Flask, request, send_file
@@ -73,7 +75,7 @@ def webhook():
 
     data = request.get_json(silent=True) or {}
     print("Webhook received; object:", data.get("object"))
-    print("FULL WEBHOOK DATA:", data)
+    print("Webhook entries received:", len(data.get("entry", [])))
 
     try:
         for entry in data.get("entry", []):
@@ -89,21 +91,170 @@ def webhook():
     return "OK", 200
 
 
+
+def _find_direct_video_url(payload):
+    """Return a likely direct video URL from explicit video fields only."""
+    candidates = []
+    def walk(obj, parent_key=""):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_l = str(key).lower()
+                if isinstance(value, str) and value.startswith("https://") and (
+                    key_l in {"video_url", "video_uri", "video_src", "video"}
+                    or (key_l == "url" and parent_key in {"video", "video_data"})
+                ):
+                    candidates.append(value)
+                elif isinstance(value, (dict, list)):
+                    walk(value, key_l)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, parent_key)
+    walk(payload)
+    for url in candidates:
+        try:
+            host = (urlparse(url).hostname or "").lower()
+            # Restrict video downloads to common Instagram/Meta media hosts.
+            if host.endswith(".cdninstagram.com") or host.endswith(".fbcdn.net") or host.endswith(".instagram.com"):
+                return url
+        except Exception:
+            pass
+    return None
+
+
+def extract_video_frames(video_url, max_frames=5, max_bytes=25 * 1024 * 1024):
+    """Download a direct Meta-hosted video URL and extract a few JPEG frames.
+
+    Requires imageio-ffmpeg. Returns frame byte strings; does not download Instagram
+    pages or attempt to bypass login/private-content restrictions.
+    """
+    if not video_url:
+        return []
+    try:
+        host = (urlparse(video_url).hostname or "").lower()
+        if not (host.endswith(".cdninstagram.com") or host.endswith(".fbcdn.net") or host.endswith(".instagram.com")):
+            print("Video frame scan skipped: host is not an allowed Meta media host.")
+            return []
+        with tempfile.TemporaryDirectory(prefix="product_frames_") as temp_dir:
+            video_path = os.path.join(temp_dir, "source_video.mp4")
+            response = requests.get(
+                video_url, stream=True, timeout=(8, 20),
+                headers={"User-Agent": "Mozilla/5.0"},
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            final_host = (urlparse(response.url).hostname or "").lower()
+            if not (final_host.endswith(".cdninstagram.com") or final_host.endswith(".fbcdn.net") or final_host.endswith(".instagram.com")):
+                print("Video frame scan blocked an unexpected redirect host.")
+                return []
+            total = 0
+            with open(video_path, "wb") as out:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        print("Video frame scan skipped: video exceeds size limit.")
+                        return []
+                    out.write(chunk)
+            response.close()
+            if total < 1024:
+                return []
+
+            try:
+                import imageio_ffmpeg
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            except ImportError:
+                print("Video frame scan unavailable: imageio-ffmpeg dependency is missing.")
+                return []
+
+            # Sample at most one frame every 3 seconds, capped at max_frames.
+            pattern = os.path.join(temp_dir, "frame_%02d.jpg")
+            command = [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-i", video_path,
+                "-vf", "fps=1/3,scale=640:-1:force_original_aspect_ratio=decrease",
+                "-frames:v", str(max_frames), "-q:v", "4", "-y", pattern,
+            ]
+            result = subprocess.run(command, capture_output=True, timeout=35, check=False)
+            if result.returncode != 0:
+                print("Video frame extraction failed:", result.stderr.decode("utf-8", "ignore")[:300])
+                return []
+            frames = []
+            for name in sorted(os.listdir(temp_dir)):
+                if re.fullmatch(r"frame_\d+\.jpg", name):
+                    with open(os.path.join(temp_dir, name), "rb") as frame:
+                        frames.append(frame.read())
+            print("Video frames extracted:", len(frames))
+            return frames[:max_frames]
+    except Exception as exc:
+        print("Video frame scan failed:", type(exc).__name__, str(exc)[:250])
+        return []
+
+
+def identify_products_from_image_bytes(image_bytes, mime_type="image/jpeg", max_products=3):
+    """Ask Gemini to identify products from actual image bytes, not post captions."""
+    if not GEMINI_API_KEY or not image_bytes:
+        return []
+    try:
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        prompt = (
+            "Identify each distinct physical product visibly shown in this image. "
+            "Use ONLY visual evidence: visible logos, readable labels, product shape and design. "
+            "Do not use captions, hashtags, creator text, or outside post context. "
+            "Return ONLY a JSON array of up to " + str(max_products) +
+            " concise product search names. Include brand/model only if visually supported. "
+            "If no product is confidently identifiable, return []."
+        )
+        body = {
+            "contents": [{"parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": encoded}},
+            ]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 180, "responseMimeType": "application/json"},
+        }
+        response = requests.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=25)
+        print("Gemini frame API status:", response.status_code)
+        if response.status_code != 200:
+            print("Gemini frame API error:", response.text[:500])
+            return []
+        candidates = response.json().get("candidates") or []
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        raw = " ".join(part.get("text", "") for part in parts).strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        names = []
+        for item in parsed:
+            if isinstance(item, str):
+                name = re.sub(r"\s+", " ", item).strip(" \t\r\n-•")
+                if len(name) >= 3 and name.casefold() not in {n.casefold() for n in names}:
+                    names.append(name[:75])
+            if len(names) >= max_products:
+                break
+        return names
+    except Exception as exc:
+        print("Gemini frame analysis failed:", type(exc).__name__, str(exc)[:250])
+        return []
+
+
 def process_message_event(event):
     sender = event.get("sender") or {}
     sender_id = sender.get("id")
-    # Handle the Verify Follow postback before normal message processing.
     postback = event.get("postback") or {}
+
+    # Keep the existing follow-verification callback intact.
     if sender_id and postback.get("payload") == "VERIFY_FOLLOW":
         verify_follow_and_unlock(sender_id)
         return
+
     message = event.get("message") or {}
     attachments = message.get("attachments") or []
-
     if not sender_id:
         print("No sender ID in event.")
         return
 
+    # A user directly sending a retailer URL is a separate workflow, not AI
+    # product identification. Do not use arbitrary text/captions as product names.
     text_content = message.get("text") or ""
     if text_content:
         direct_links = extract_shopping_links(text_content)
@@ -112,170 +263,201 @@ def process_message_event(event):
             return
 
     if not attachments:
-        print("No attachments in this event.")
+        if text_content and re.search(
+            r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/",
+            text_content,
+            re.I,
+        ):
+            send_simple_message(
+                sender_id,
+                "Instagram link mil gaya, lekin uska product identify karne ke liye accessible image/thumbnail chahiye. "
+                "Agar post ka visual access nahi hua, product ka clear screenshot/photo DM karo. "
+                "Main caption se product ka naam guess nahi karunga.",
+            )
+        else:
+            print("No attachments in this event.")
         return
 
     for attachment in attachments:
         attachment_type = attachment.get("type")
         payload = attachment.get("payload") or {}
 
-        # Reliable free visual route: process an actual image/screenshot sent in DM.
-        # A shared Reel webhook generally provides only the Reel URL, not its video frame.
         if attachment_type == "image":
-            image_url = (
-                payload.get("url")
-                or payload.get("image_url")
-                or payload.get("thumbnail_url")
-            )
-            if not image_url:
-                print("Image attachment received without a usable URL.")
+            image_urls = find_image_urls(payload, limit=3)
+            if not image_urls:
+                candidate = (
+                    payload.get("url")
+                    or payload.get("image_url")
+                    or payload.get("thumbnail_url")
+                )
+                if candidate:
+                    image_urls = [candidate]
+
+            if not image_urls:
                 send_simple_message(
                     sender_id,
-                    "Image mili, lekin uska direct URL nahi mila. Product ka clear screenshot/photo DM mein bhejo ya product ka naam likho."
+                    "Image mili, lekin accessible image URL nahi mila. Product ka clear screenshot/photo dobara DM karo.",
                 )
                 continue
             if not GEMINI_API_KEY:
                 print("Image attachment received but GEMINI_API_KEY is missing.")
-                send_simple_message(sender_id, "Gemini key configured nahi hai; product ka naam text mein bhej do.")
+                send_simple_message(sender_id, "Visual detection ke liye GEMINI_API_KEY configured nahi hai.")
                 continue
 
-            visual_terms = identify_product_from_image_url(image_url)
-            if visual_terms:
-                print("Gemini identified product from DM image:", visual_terms[:160])
-                product_data = make_search_row(f"image-{sender_id}", visual_terms)
-                send_product_buttons(sender_id, product_data)
-            else:
-                send_simple_message(
-                    sender_id,
-                    "Image mil gayi, lekin product clear identify nahi hua. Product ka close-up screenshot bhejo ya naam text mein likho."
-                )
-            continue
-
-        if attachment_type not in ("share", "ig_reel", "ig_post"):
-            continue
-
-        reel_url = payload.get("url") or payload.get("link")
-        reel_id = (
-            payload.get("reel_video_id")
-            or payload.get("ig_post_media_id")
-            or payload.get("media_id")
-        )
-
-        caption_text = " ".join(
-            str(payload.get(key) or "")
-            for key in ("caption", "title", "text", "description", "permalink")
-        ).strip()
-        direct_links = extract_shopping_links(caption_text)
-        public_clues = ""
-        public_thumbnail = None
-        # Stage 2: inspect publicly available Reel metadata for extra text/link clues.
-        # This does not bypass private content or Instagram access restrictions.
-        if reel_url:
-            public_clues, page_product_links, public_thumbnail = inspect_public_reel_page(reel_url)
-            if not direct_links and page_product_links:
-                direct_links = page_product_links
-            if public_clues:
-                caption_text = (caption_text + " " + public_clues).strip()
-
-        if not reel_id and reel_url:
-            reel_id = extract_reel_id(reel_url)
-
-        if not reel_id:
-            print("Reel ID could not be extracted:", payload)
-            if direct_links:
-                send_links_as_buttons(sender_id, direct_links, "Shopping link found")
-            else:
-                send_simple_message(
-                    sender_id,
-                    "Reel mil gayi, lekin ID identify nahi hui. Reel ka link/caption text ke saath bhej do."
-                )
-            continue
-
-        print("Detected Reel ID:", reel_id)
-
-        # Reuse cached product cards, but retry older single-query cache entries
-        # so newly enabled visual multi-product detection can replace them.
-        product_data = get_products_from_db(reel_id)
-        if product_data and has_product_links(product_data):
-            cached_titles = [
-                str(product_data.get(f"product_{i}_title") or "").strip()
-                for i in range(1, 4)
-            ]
-            cached_count = sum(bool(title) for title in cached_titles)
-            is_old_single_search = (
-                cached_count == 1
-                and cached_titles[0].lower().startswith("search amazon:")
-            )
-            if not is_old_single_search:
-                send_product_buttons(sender_id, product_data)
-                continue
-            print("Old single-search cache found; retrying product detection:", reel_id)
-
-        # If the webhook includes a real shopping link, use it.
-        if direct_links:
-            product_data = make_product_row(reel_id, direct_links, "Link from Reel caption/metadata")
-            save_products_to_db(product_data)
-            send_product_buttons(sender_id, product_data)
-            continue
-
-        # Visual analysis: inspect up to three distinct accessible thumbnails/images.
-        # A normal post can work when its webhook payload includes image URLs. For a
-        # shared Reel permalink alone, this is still thumbnail analysis, NOT full video
-        # frame scanning; Instagram does not reliably expose the actual video file here.
-        image_urls = find_image_urls(payload, limit=3)
-        if public_thumbnail and public_thumbnail not in image_urls:
-            image_urls.append(public_thumbnail)
-        if not image_urls and reel_url:
-            discovered = discover_public_thumbnail(reel_url)
-            if discovered:
-                image_urls.append(discovered)
-        image_urls = image_urls[:3]
-
-        visual_products = []
-        visual_terms = ""
-        if image_urls and GEMINI_API_KEY:
+            visual_products = []
             for image_index, image_url in enumerate(image_urls, start=1):
-                print(f"Visual analysis image {image_index}/{len(image_urls)}")
-                image_products = identify_products_from_image_url(image_url, max_products=3)
-                for product_name in image_products:
-                    if product_name.lower() not in {x.lower() for x in visual_products}:
-                        visual_products.append(product_name)
+                print(f"Visual-only DM image analysis {image_index}/{len(image_urls)}")
+                for name in identify_products_from_image_url(image_url, max_products=3):
+                    if name and name.casefold() not in {x.casefold() for x in visual_products}:
+                        visual_products.append(name)
                     if len(visual_products) >= 3:
                         break
                 if len(visual_products) >= 3:
                     break
-                if not visual_terms:
-                    visual_terms = identify_product_from_image_url(image_url)
-        elif image_urls and not GEMINI_API_KEY:
-            print("Image URL present but GEMINI_API_KEY is missing.")
-        else:
-            print("MULTI_PRODUCT_BLOCKED: no accessible Reel/post thumbnail; caption-only fallback will be used.")
+
+            if not visual_products:
+                # Image-only fallback. This still sends the image to Gemini; it
+                # never substitutes caption, title, or message text as the name.
+                for image_url in image_urls:
+                    name = identify_product_from_image_url(image_url)
+                    if name and name.casefold() not in {"unknown", "none", "not identifiable"}:
+                        visual_products.append(name)
+                        break
+
+            if visual_products:
+                print("VISUAL_ONLY_DM_PRODUCTS:", visual_products)
+                product_data = make_multi_product_row(
+                    f"image-{sender_id}-{__import__('time').time_ns()}",
+                    visual_products,
+                )
+                send_product_buttons(sender_id, product_data)
+            else:
+                send_simple_message(
+                    sender_id,
+                    "Image mil gayi, lekin product ko image se confidently identify nahi kar paya. "
+                    "Product ka clearer/closer screenshot bhejo. Caption ya text ko product name nahi banaya gaya.",
+                )
+            continue
+
+        if attachment_type not in ("share", "ig_reel", "ig_post"):
+            print("Ignoring unsupported attachment type:", attachment_type)
+            continue
+
+        post_url = payload.get("url") or payload.get("link")
+        media_id = (
+            payload.get("reel_video_id")
+            or payload.get("ig_post_media_id")
+            or payload.get("media_id")
+        )
+        if not media_id and post_url:
+            media_id = extract_reel_id(post_url)
+
+        if not media_id:
+            # Some webhook formats carry a shared post without a parseable
+            # permalink. Do not fall back to caption-based product guessing.
+            print("Instagram post/Reel ID unavailable in webhook payload.")
+            send_simple_message(
+                sender_id,
+                "Post/Reel mil gayi, lekin uska ID ya accessible visual nahi mila. "
+                "Post ka clear screenshot/photo DM karo; main image se product identify karunga.",
+            )
+            continue
+
+        print("Detected Instagram media ID:", media_id)
+
+        # Cache only rows that contain names explicitly generated from visual
+        # detection. Legacy caption searches and retailer-link labels are stale
+        # for the new visual-only requirement and must be reprocessed.
+        cached = get_products_from_db(media_id)
+        if cached and has_product_links(cached):
+            titles = [
+                str(cached.get(f"product_{i}_title") or "").strip()
+                for i in range(1, 4)
+            ]
+            is_visual_cache = any(
+                title.lower().startswith("product:") for title in titles
+            )
+            if is_visual_cache:
+                send_product_buttons(sender_id, cached)
+                continue
+            print("Ignoring legacy non-visual cache entry:", media_id)
+
+        # Public-page lookup is used ONLY to obtain a thumbnail. Captions,
+        # descriptions, embedded text, and retailer links are deliberately ignored.
+        image_urls = find_image_urls(payload, limit=3)
+        if post_url:
+            public_thumbnail = discover_public_thumbnail(post_url)
+            if public_thumbnail and public_thumbnail not in image_urls:
+                image_urls.append(public_thumbnail)
+        image_urls = image_urls[:3]
+
+        # If the webhook explicitly includes a direct video URL, scan sampled frames
+        # first. A normal Instagram permalink is NOT treated as a video file.
+        video_url = _find_direct_video_url(payload)
+        frame_products = []
+        if video_url and GEMINI_API_KEY:
+            for frame_bytes in extract_video_frames(video_url, max_frames=5):
+                for name in identify_products_from_image_bytes(frame_bytes, max_products=3):
+                    if name and name.casefold() not in {x.casefold() for x in frame_products}:
+                        frame_products.append(name)
+                    if len(frame_products) >= 3:
+                        break
+                if len(frame_products) >= 3:
+                    break
+
+        if frame_products:
+            print("VISUAL_VIDEO_FRAME_PRODUCTS:", len(frame_products), frame_products)
+            product_data = make_multi_product_row(str(media_id), frame_products)
+            save_products_to_db(product_data)
+            send_product_buttons(sender_id, product_data)
+            continue
+
+        if not image_urls:
+            print("No accessible visual for Instagram media:", media_id)
+            send_simple_message(
+                sender_id,
+                "Is Instagram post/Reel ka accessible image/thumbnail nahi mila. "
+                "Instagram share mein kabhi-kabhi sirf link aata hai, video frames nahi. "
+                "Product ka clear screenshot/photo DM karo; main caption se naam guess nahi karunga.",
+            )
+            continue
+
+        if not GEMINI_API_KEY:
+            print("Visuals available but GEMINI_API_KEY is missing.")
+            send_simple_message(sender_id, "Visual product detection ke liye GEMINI_API_KEY configured nahi hai.")
+            continue
+
+        visual_products = []
+        for image_index, image_url in enumerate(image_urls, start=1):
+            print(f"Visual-only post/Reel analysis {image_index}/{len(image_urls)}")
+            detected = identify_products_from_image_url(image_url, max_products=3)
+            for name in detected:
+                if name and name.casefold() not in {x.casefold() for x in visual_products}:
+                    visual_products.append(name)
+                if len(visual_products) >= 3:
+                    break
+            if len(visual_products) >= 3:
+                break
+
+        if not visual_products:
+            for image_url in image_urls:
+                name = identify_product_from_image_url(image_url)
+                if name and name.casefold() not in {"unknown", "none", "not identifiable"}:
+                    visual_products.append(name)
+                    break
 
         if visual_products:
-            print("MULTI_PRODUCT_RESULT:", len(visual_products), visual_products)
-            product_data = make_multi_product_row(reel_id, visual_products)
+            print("VISUAL_ONLY_PRODUCTS:", len(visual_products), visual_products)
+            product_data = make_multi_product_row(str(media_id), visual_products)
             save_products_to_db(product_data)
             send_product_buttons(sender_id, product_data)
         else:
-            print("MULTI_PRODUCT_RESULT: 0; falling back to a single caption-based search.")
-            # Stage 4: combine all available text clues after visual detection.
-            # Emoji-only captions naturally yield no query; we never invent an exact product link.
-            search_terms = (
-                visual_terms
-                or make_search_terms(caption_text)
-                or make_search_terms(" ".join(str(payload.get(k) or "") for k in ("title", "caption", "description", "text")))
+            print("Visual detector returned no confident product name.")
+            send_simple_message(
+                sender_id,
+                "Image/thumbnail mil gaya, lekin product ko visually confidently identify nahi kar paya. "
+                "Product ka closer screenshot/photo bhejo. Caption ko product name ke liye use nahi kiya gaya.",
             )
-            if search_terms:
-                product_data = make_search_row(reel_id, search_terms)
-                save_products_to_db(product_data)
-                send_product_buttons(sender_id, product_data)
-            else:
-                print("No visual details or caption/product keywords available for Reel ID:", reel_id)
-                send_simple_message(
-                    sender_id,
-                    "Reel mil gayi, lekin product identify karne ke liye caption ya accessible thumbnail nahi mila. "
-                    "Product ka naam/caption bhej do, main shopping-search links bana dunga."
-                )
 
 
 def extract_reel_id(url):
@@ -451,9 +633,10 @@ def identify_product_from_image_url(image_url):
             "contents": [{
                 "parts": [
                     {"text": (
-                        "Look at this product image. Identify only visible product category, "
-                        "brand/model if clearly readable, and useful shopping search keywords. "
-                        "Do not guess a brand if not visible. Return one concise search query only."
+                        "Identify the physical product shown in this image using visual evidence only. "
+                        "Do not use or assume any caption, hashtags, creator text, or post context. "
+                        "Return visible brand/model and product type only when supported by the image; "
+                        "otherwise return UNKNOWN. Return one concise product name/search query only."
                     )},
                     {"inline_data": {"mime_type": mime_type, "data": encoded}}
                 ]
@@ -510,6 +693,7 @@ def identify_products_from_image_url(image_url, max_products=3):
         encoded = base64.b64encode(image_response.content).decode("ascii")
         prompt = (
             "Identify each distinct physical product/item visibly shown in this image, not just the overall category. "
+            "Use only pixels, visible logos, and readable labels in this image; do not use caption, hashtags, creator text, or post context. "
             "Return ONLY a JSON array of 1 to " + str(max_products) + " short product search names. "
             "Include brand/model only when readable or clearly recognizable; do not invent brands. "
             "For a lineup/display containing several different bottles/items, return each distinct visible item separately. "
@@ -549,7 +733,7 @@ def identify_products_from_image_url(image_url, max_products=3):
         for item in parsed:
             if not isinstance(item, str):
                 continue
-            name = re.sub(r"\s+", " ", item).strip(" \t\r\n-•")
+                name = re.sub(r"\s+", " ", item).strip(" \t\r\n-•")
             if len(name) < 3:
                 continue
             if name.lower() not in {x.lower() for x in cleaned}:
@@ -737,7 +921,7 @@ def send_follow_gate(recipient_id):
             "attachment": {
                 "type": "template",
                 "payload": {
-                    "template_type": "generic",
+                    "template_type": "generic",   
                     "elements": [{
                         "title": "Follow to unlock product links",
                         "subtitle": "Follow @find_myproduct52, then tap Verify Follow.",
@@ -981,3 +1165,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
     
+                    
+      
